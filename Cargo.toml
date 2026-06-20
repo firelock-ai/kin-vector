@@ -14,6 +14,7 @@ repository = "https://github.com/firelock-ai/kin-vector"
 doctest = false
 
 [features]
+default = ["simd"]
 # Opt-in SIMD distance kernel (aarch64 NEON). DEFAULT OFF: with this feature
 # disabled the crate compiles to the scalar reduction only, byte-for-byte
 # unchanged. Even when compiled in, the SIMD path is additionally gated at

@@ -230,17 +230,18 @@ fn cosine_distance_scalar(a: &[f32], b: &[f32]) -> f32 {
     1.0 - dot / denom
 }
 
-/// Runtime gate for the SIMD distance kernel (`KIN_VECTOR_SIMD`, default OFF).
+/// Runtime gate for the SIMD distance kernel (`KIN_VECTOR_SIMD`, default ON when features=simd).
 /// Sampled once per process so the hot path never re-reads the environment.
 #[cfg(feature = "simd")]
 fn simd_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("KIN_VECTOR_SIMD").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        )
+        let var = std::env::var("KIN_VECTOR_SIMD").ok();
+        match var.as_deref() {
+            Some("0") | Some("false") | Some("no") | Some("off") => false,
+            _ => true,
+        }
     })
 }
 
@@ -1454,6 +1455,32 @@ impl<Id: VectorId> VectorIndex<Id> {
         graph.insert(entity_id, embedding)
     }
 
+    /// Add or update a batch of embeddings for entities under a single write lock.
+    pub fn upsert_batch(&self, items: Vec<(Id, Vec<f32>)>) -> Result<(), VectorError> {
+        let _span = tracing::info_span!("kin_vector.upsert_batch", count = items.len()).entered();
+        let mut graph = self.graph.write();
+
+        for (entity_id, embedding) in items {
+            if embedding.len() != graph.dimensions {
+                return Err(VectorError::IndexError(format!(
+                    "embedding dimension mismatch: expected {}, got {}",
+                    graph.dimensions,
+                    embedding.len()
+                )));
+            }
+            graph.remove(&entity_id);
+            graph.insert(entity_id, &embedding)?;
+        }
+
+        Ok(())
+    }
+
+    /// Rebuilds the graph from scratch in canonical insertion order to ensure deterministic serialization.
+    pub fn ensure_canonical_order(&self) -> Result<(), VectorError> {
+        let mut graph = self.graph.write();
+        graph.ensure_canonical_order()
+    }
+
     /// Remove the embedding for an entity.
     pub fn remove(&self, entity_id: &Id) -> Result<(), VectorError> {
         let _span = tracing::info_span!("kin_vector.remove").entered();
@@ -1476,21 +1503,20 @@ impl<Id: VectorId> VectorIndex<Id> {
             limit = limit
         )
         .entered();
-        self.with_canonical_graph(|graph| {
-            if embedding.len() != graph.dimensions {
-                return Err(VectorError::IndexError(format!(
-                    "query dimension mismatch: expected {}, got {}",
-                    graph.dimensions,
-                    embedding.len()
-                )));
-            }
+        let graph = self.graph.read();
+        if embedding.len() != graph.dimensions {
+            return Err(VectorError::IndexError(format!(
+                "query dimension mismatch: expected {}, got {}",
+                graph.dimensions,
+                embedding.len()
+            )));
+        }
 
-            if graph.active_count() == 0 {
-                return Ok(Vec::new());
-            }
+        if graph.active_count() == 0 {
+            return Ok(Vec::new());
+        }
 
-            Ok(graph.search(embedding, limit, None))
-        })
+        Ok(graph.search(embedding, limit, None))
     }
 
     /// Search for the `limit` most similar entities to the given embedding, filtering by a predicate.
@@ -1509,21 +1535,20 @@ impl<Id: VectorId> VectorIndex<Id> {
         )
         .entered();
         let pred_dyn: &dyn Fn(&Id) -> bool = &predicate;
-        self.with_canonical_graph(|graph| {
-            if embedding.len() != graph.dimensions {
-                return Err(VectorError::IndexError(format!(
-                    "query dimension mismatch: expected {}, got {}",
-                    graph.dimensions,
-                    embedding.len()
-                )));
-            }
+        let graph = self.graph.read();
+        if embedding.len() != graph.dimensions {
+            return Err(VectorError::IndexError(format!(
+                "query dimension mismatch: expected {}, got {}",
+                graph.dimensions,
+                embedding.len()
+            )));
+        }
 
-            if graph.active_count() == 0 {
-                return Ok(Vec::new());
-            }
+        if graph.active_count() == 0 {
+            return Ok(Vec::new());
+        }
 
-            Ok(graph.search(embedding, limit, Some(pred_dyn)))
-        })
+        Ok(graph.search(embedding, limit, Some(pred_dyn)))
     }
 
     /// Set the persistence path for this index.
@@ -2049,6 +2074,8 @@ mod tests {
 
         let a = build(&sorted, dim);
         let b = build(&reversed, dim);
+        a.ensure_canonical_order().unwrap();
+        b.ensure_canonical_order().unwrap();
         assert_eq!(a.len(), b.len(), "same vector SET must give same size");
 
         let limit = 20;
