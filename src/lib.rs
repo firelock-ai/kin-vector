@@ -232,9 +232,11 @@ fn cosine_distance_scalar(a: &[f32], b: &[f32]) -> f32 {
     1.0 - dot / denom
 }
 
-/// Runtime gate for the SIMD distance kernel (`KIN_VECTOR_SIMD`, default ON when features=simd).
+/// Runtime gate for the SIMD distance kernel (`KIN_VECTOR_SIMD`, default ON).
 /// Sampled once per process so the hot path never re-reads the environment.
-#[cfg(feature = "simd")]
+/// Gated to aarch64 to match its only caller (the NEON branch of
+/// [`cosine_distance`]); on other targets there is no SIMD kernel to gate.
+#[cfg(all(feature = "simd", target_arch = "aarch64"))]
 fn simd_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
