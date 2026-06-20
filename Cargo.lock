@@ -197,7 +197,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vector"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fs2",
  "hashbrown 0.15.5",
@@ -786,23 +786,3 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
-
-[[patch.unused]]
-name = "kin-blobs"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "kin-db"
-version = "0.2.8"
-
-[[patch.unused]]
-name = "kin-infer"
-version = "0.2.3"
-
-[[patch.unused]]
-name = "kin-model"
-version = "0.2.0"
-
-[[patch.unused]]
-name = "kin-search"
-version = "0.1.0"
