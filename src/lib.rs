@@ -1770,10 +1770,24 @@ impl<Id: VectorId> VectorIndex<Id> {
         atomic_save_bytes(path, &bytes, "vector index")
     }
 
-    /// Load a previously saved HNSW index from disk.
+    /// Load a previously saved HNSW index from disk (dimension check only).
     ///
-    /// Returns a new `VectorIndex` with the loaded index data.
-    /// The `dimensions` parameter is used to validate the loaded data matches.
+    /// # Deprecation
+    ///
+    /// Prefer [`VectorIndex::load_checked`] whenever the index was built by a
+    /// specific embedding model. `load` checks only that the stored dimension
+    /// matches `dimensions`; it does **not** verify model identity or graph
+    /// provenance. Two embedding models can share the same dimension while
+    /// producing incompatible vector spaces, so a model swap can load
+    /// silently-wrong neighbors without any error. `load_checked` adds the
+    /// provenance check and returns [`VectorError::ModelMismatch`] in that case.
+    ///
+    /// Use `load` only when no `IndexDescriptor` is available (e.g. loading an
+    /// index for inspection without the original model context).
+    #[deprecated(
+        note = "Use `load_checked` instead; `load` only verifies dimensions and will \
+                silently return wrong neighbors after a same-dimension model swap."
+    )]
     pub fn load(path: &Path, dimensions: usize) -> Result<Self, VectorError> {
         let _span = tracing::info_span!(
             "kin_vector.load",
@@ -1795,17 +1809,28 @@ impl<Id: VectorId> VectorIndex<Id> {
     /// caller's `expected` self-description (model identity + graph provenance),
     /// in addition to vector dimensionality.
     ///
-    /// Use this instead of [`VectorIndex::load`] whenever the index was built by
-    /// a specific embedding model: it returns [`VectorError::ModelMismatch`] when
-    /// a same-dimension model swap (or graph-root change) would otherwise load
-    /// silently-wrong vectors. Only the fields the caller pins on `expected` are
-    /// enforced (see [`IndexDescriptor::verify_compatible`]).
+    /// Returns [`VectorError::ModelMismatch`] when a same-dimension model swap
+    /// (or graph-root change) would otherwise load silently-wrong vectors. Only
+    /// the fields the caller pins on `expected` are enforced (see
+    /// [`IndexDescriptor::verify_compatible`]).
     pub fn load_checked(
         path: &Path,
         dimensions: usize,
         expected: &IndexDescriptor,
     ) -> Result<Self, VectorError> {
-        let vi = Self::load(path, dimensions)?;
+        let _span = tracing::info_span!(
+            "kin_vector.load_checked",
+            path = %path.display(),
+            dimensions = dimensions
+        )
+        .entered();
+        let vi = Self::load_from_disk(path)?;
+        let loaded_dims = vi.dimensions();
+        if loaded_dims != dimensions {
+            return Err(VectorError::IndexError(format!(
+                "loaded vector index has dimensions {loaded_dims}, expected {dimensions}",
+            )));
+        }
         vi.descriptor().verify_compatible(expected)?;
         Ok(vi)
     }
