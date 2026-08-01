@@ -1212,7 +1212,11 @@ fn acquire_write_lock(path: &Path, label: &str) -> Result<File, VectorError> {
 }
 
 fn fsync_and_rename(tmp_path: &Path, path: &Path) -> Result<(), VectorError> {
-    let file = File::open(tmp_path).map_err(|e| {
+    // `File::open` is read-only. Unix accepts `fsync` on that descriptor, but
+    // Windows implements `File::sync_all` with `FlushFileBuffers`, whose handle
+    // must carry GENERIC_WRITE. Reopen without create/truncate so the already
+    // written candidate is flushed exactly as-is on every platform.
+    let file = OpenOptions::new().write(true).open(tmp_path).map_err(|e| {
         VectorError::IndexError(format!(
             "failed to reopen for fsync {}: {e}",
             tmp_path.display()
@@ -1241,7 +1245,10 @@ fn fsync_and_rename(tmp_path: &Path, path: &Path) -> Result<(), VectorError> {
 fn write_bytes_with_fsync(path: &Path, bytes: &[u8]) -> Result<(), VectorError> {
     fs::write(path, bytes)
         .map_err(|e| VectorError::IndexError(format!("failed to write {}: {e}", path.display())))?;
-    let file = File::open(path).map_err(|e| {
+    // Keep the reopen writable for the same cross-platform reason as
+    // `fsync_and_rename`: Windows refuses FlushFileBuffers on a read-only
+    // handle with ERROR_ACCESS_DENIED.
+    let file = OpenOptions::new().write(true).open(path).map_err(|e| {
         VectorError::IndexError(format!(
             "failed to reopen for fsync {}: {e}",
             path.display()
@@ -2849,6 +2856,21 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, e1);
         assert_eq!(results[1].0, e3);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn persistence_flushes_writable_windows_handles_before_promotion() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.hnsw");
+        let tmp_path = recovery_tmp_path(&path);
+
+        write_bytes_with_fsync(&tmp_path, b"durable vector candidate")
+            .expect("FlushFileBuffers must receive a writable temporary-file handle");
+        fsync_and_rename(&tmp_path, &path)
+            .expect("the writable candidate must flush before atomic promotion");
+
+        assert_eq!(fs::read(path).unwrap(), b"durable vector candidate");
     }
 
     #[test]
