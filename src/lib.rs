@@ -332,6 +332,172 @@ unsafe fn cosine_distance_neon(a: &[f32], b: &[f32]) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
+// Distance with the norms lifted out
+// ---------------------------------------------------------------------------
+//
+// The fused kernels above run three accumulator chains over one pass: `dot`,
+// `norm_a`, and `norm_b`. A search evaluates that against every visited node, so
+// it recomputes the query's norm once per candidate and each node's norm once
+// per query — three multiply-adds per element where one would do.
+//
+// The chains are independent: no chain reads another's accumulator, and each
+// visits the elements in the same fixed order. Lifting one chain into its own
+// loop therefore reproduces its operation sequence exactly and leaves the others
+// untouched, so a distance assembled from separately-computed parts is
+// bit-identical to the fused one rather than merely close. That is what makes
+// memoizing a norm safe here: nothing is approximated and no vector is assumed
+// to be unit-length. kin-vector accepts any finite vector through `upsert` and
+// stores it verbatim, so the norms are measured, never assumed.
+
+/// Squared L2 norm — the plain sum of squares, NOT its square root — computed
+/// with the same kernel dispatch and reduction order the matching
+/// [`cosine_distance`] kernel uses for its `norm_a` / `norm_b` accumulators.
+///
+/// This is the value [`cosine_distance_with_sq_norms`] expects. Because the
+/// kernel choice is a process-global gate, a norm computed here always matches
+/// the kernel that will consume it; a norm carried between processes would not,
+/// which is why nothing persists these.
+#[inline]
+pub fn squared_norm(v: &[f32]) -> f32 {
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+    {
+        if simd_enabled() {
+            // SAFETY: as in `cosine_distance` — NEON is part of the mandatory
+            // aarch64 baseline, so no runtime CPU probe is needed.
+            return unsafe { squared_norm_neon(v) };
+        }
+    }
+    squared_norm_scalar(v)
+}
+
+/// Sequential sum of squares — the exact reduction
+/// [`cosine_distance_scalar`] applies to build `norm_a` / `norm_b`.
+#[inline]
+fn squared_norm_scalar(v: &[f32]) -> f32 {
+    let mut acc = 0.0f32;
+    for &x in v {
+        acc += x * x;
+    }
+    acc
+}
+
+/// Four-lane sum of squares — the exact reduction [`cosine_distance_neon`]
+/// applies to build `na` / `nb`: the same lane layout, the same single
+/// `vaddvq_f32` fold, the same sequential `len % 4` tail, and the same
+/// deliberate mul-then-add.
+///
+/// SAFETY: NEON is guaranteed on aarch64; callers invoke this only under
+/// `cfg(target_arch = "aarch64")`.
+#[cfg(all(feature = "simd", target_arch = "aarch64"))]
+#[target_feature(enable = "neon")]
+unsafe fn squared_norm_neon(v: &[f32]) -> f32 {
+    use core::arch::aarch64::*;
+
+    let n = v.len();
+    let mut acc = vdupq_n_f32(0.0);
+
+    let mut i = 0usize;
+    let simd_end = n - (n % 4);
+    while i < simd_end {
+        let x = vld1q_f32(v.as_ptr().add(i));
+        acc = vaddq_f32(acc, vmulq_f32(x, x));
+        i += 4;
+    }
+
+    let mut acc_s = vaddvq_f32(acc);
+
+    while i < n {
+        let x = *v.get_unchecked(i);
+        acc_s += x * x;
+        i += 1;
+    }
+
+    acc_s
+}
+
+/// Cosine distance from vectors whose squared norms are already known.
+///
+/// `sq_norm_a` and `sq_norm_b` must be [`squared_norm`] of `a` and `b`. Given
+/// that, this returns the same bits as `cosine_distance(a, b)` for every input:
+/// the dot product is accumulated by the same kernel in the same order, and the
+/// denominator, the degenerate-norm short-circuit, and the final expression are
+/// unchanged.
+#[inline]
+pub fn cosine_distance_with_sq_norms(a: &[f32], sq_norm_a: f32, b: &[f32], sq_norm_b: f32) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    if a.is_empty() || b.is_empty() || a.len() != b.len() {
+        return 1.0;
+    }
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+    {
+        if simd_enabled() {
+            // SAFETY: as in `cosine_distance` — NEON is part of the mandatory
+            // aarch64 baseline, so no runtime CPU probe is needed.
+            let dot = unsafe { dot_neon(a, b) };
+            return cosine_from_parts(dot, sq_norm_a, sq_norm_b);
+        }
+    }
+    cosine_from_parts(dot_scalar(a, b), sq_norm_a, sq_norm_b)
+}
+
+/// The tail both cosine kernels share once `dot` and the two squared norms
+/// exist: `1 - dot / sqrt(na * nb)`, with the degenerate-denominator guard that
+/// keeps a zero-norm input from producing NaN.
+#[inline]
+fn cosine_from_parts(dot: f32, sq_norm_a: f32, sq_norm_b: f32) -> f32 {
+    let denom = (sq_norm_a * sq_norm_b).sqrt();
+    if denom < f32::EPSILON {
+        return 1.0;
+    }
+    1.0 - dot / denom
+}
+
+/// Sequential dot product — the exact reduction [`cosine_distance_scalar`]
+/// applies to build `dot`.
+#[inline]
+fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
+    let mut dot = 0.0f32;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+    }
+    dot
+}
+
+/// Four-lane dot product — the exact reduction [`cosine_distance_neon`] applies
+/// to build `dot`, down to the fold and the sequential tail.
+///
+/// SAFETY: NEON is guaranteed on aarch64; callers invoke this only under
+/// `cfg(target_arch = "aarch64")`.
+#[cfg(all(feature = "simd", target_arch = "aarch64"))]
+#[target_feature(enable = "neon")]
+unsafe fn dot_neon(a: &[f32], b: &[f32]) -> f32 {
+    use core::arch::aarch64::*;
+
+    let n = a.len();
+    let mut dot = vdupq_n_f32(0.0);
+
+    let mut i = 0usize;
+    let simd_end = n - (n % 4);
+    while i < simd_end {
+        let va = vld1q_f32(a.as_ptr().add(i));
+        let vb = vld1q_f32(b.as_ptr().add(i));
+        dot = vaddq_f32(dot, vmulq_f32(va, vb));
+        i += 4;
+    }
+
+    let mut dot_s = vaddvq_f32(dot);
+
+    while i < n {
+        let x = *a.get_unchecked(i);
+        let y = *b.get_unchecked(i);
+        dot_s += x * y;
+        i += 1;
+    }
+
+    dot_s
+}
+
+// ---------------------------------------------------------------------------
 // Index self-description (model identity + graph provenance)
 // ---------------------------------------------------------------------------
 
@@ -481,6 +647,22 @@ pub struct HnswGraph<Id: VectorId = DefaultId> {
     /// canonical key order so final topology is independent of ingestion order.
     #[serde(skip)]
     pub canonical_order_dirty: bool,
+    /// [`squared_norm`] of each node's vector, parallel to `nodes`. A search
+    /// evaluates a node's norm once per query without it; with it, once per
+    /// load.
+    ///
+    /// Rebuilt on load beside `backlinks` and deliberately not serialized: the
+    /// value depends on which distance kernel this process resolved (the `simd`
+    /// feature and the `KIN_VECTOR_SIMD` gate), so a persisted norm could reach
+    /// a process running the other kernel and break the bit-identity the memo
+    /// rests on.
+    ///
+    /// Read only when it is exactly as long as `nodes`, and grown only in step
+    /// with `nodes` — a graph assembled by writing `nodes` directly leaves it
+    /// empty, and the distance path falls back to the fused kernel, which is
+    /// slower and never different.
+    #[serde(skip)]
+    pub sq_norms: Vec<f32>,
 }
 
 /// Read-only result of planning a node's insertion against a fixed graph state.
@@ -509,6 +691,7 @@ impl<Id: VectorId> HnswGraph<Id> {
             descriptor: IndexDescriptor::default(),
             backlinks: Vec::new(),
             canonical_order_dirty: false,
+            sq_norms: Vec::new(),
         }
     }
 
@@ -517,7 +700,7 @@ impl<Id: VectorId> HnswGraph<Id> {
     }
 
     /// A persistence snapshot of the graph: the serialized fields copied, with the
-    /// rebuilt-on-load reverse index dropped and the canonical-order flag cleared.
+    /// rebuilt-on-load derived tables dropped and the canonical-order flag cleared.
     /// Taken under the graph lock so the heavy serialize + fsync can run after the
     /// lock is released, without blocking concurrent upserts.
     fn clone_for_persist(&self) -> HnswGraph<Id> {
@@ -533,6 +716,7 @@ impl<Id: VectorId> HnswGraph<Id> {
             descriptor: self.descriptor.clone(),
             backlinks: Vec::new(),
             canonical_order_dirty: false,
+            sq_norms: Vec::new(),
         }
     }
 
@@ -566,7 +750,10 @@ impl<Id: VectorId> HnswGraph<Id> {
             return Vec::new();
         }
 
-        let entry_dist = cosine_distance(query, &self.nodes[entry].vector);
+        // The query's own norm is the same for every node this traversal visits,
+        // so it is measured once here instead of once per candidate.
+        let query_sq_norm = squared_norm(query);
+        let entry_dist = self.distance_to_node(query, query_sq_norm, entry);
 
         // Heap entries are ordered by (distance, key_hash, idx). The key_hash —
         // a process-independent hash of the node's key — breaks distance ties so
@@ -610,7 +797,7 @@ impl<Id: VectorId> HnswGraph<Id> {
                 if layer >= self.nodes[nb].connections.len() {
                     continue;
                 }
-                let nb_dist = cosine_distance(query, &self.nodes[nb].vector);
+                let nb_dist = self.distance_to_node(query, query_sq_norm, nb);
                 let worst_dist = result
                     .peek()
                     .map(|(OrderedF32(d), _, _)| *d)
@@ -652,6 +839,13 @@ impl<Id: VectorId> HnswGraph<Id> {
             target_level = target_level
         )
         .entered();
+        // Both norms this descent needs are loop-invariant: the query's, and the
+        // current node's, which only changes when the descent moves. Distance is
+        // a pure function of the two vectors, so carrying `d_cur` forward and
+        // refreshing it exactly when `current` moves gives the same comparisons
+        // the per-neighbor recomputation gave.
+        let query_sq_norm = squared_norm(query);
+        let mut d_cur = self.distance_to_node(query, query_sq_norm, current);
         let mut level = top_level;
         while level > target_level {
             let mut changed = true;
@@ -666,10 +860,10 @@ impl<Id: VectorId> HnswGraph<Id> {
                         if level >= self.nodes[nb].connections.len() {
                             continue;
                         }
-                        let d_nb = cosine_distance(query, &self.nodes[nb].vector);
-                        let d_cur = cosine_distance(query, &self.nodes[current].vector);
+                        let d_nb = self.distance_to_node(query, query_sq_norm, nb);
                         if d_nb < d_cur {
                             current = nb;
+                            d_cur = d_nb;
                             changed = true;
                         }
                     }
@@ -784,6 +978,61 @@ impl<Id: VectorId> HnswGraph<Id> {
         }
     }
 
+    /// Recompute the whole `sq_norms` table from `nodes`.
+    fn rebuild_sq_norms(&mut self) {
+        self.sq_norms.clear();
+        self.sq_norms.reserve(self.nodes.len());
+        self.sq_norms
+            .extend(self.nodes.iter().map(|node| squared_norm(&node.vector)));
+    }
+
+    /// Record the norm of a node just appended to `nodes`.
+    ///
+    /// Appends only when the table was tracking `nodes` up to that push.
+    /// Otherwise it rebuilds, because extending a table that had fallen behind
+    /// would make its LENGTH match while the entries it never saw stayed unset —
+    /// a memo that reads as ready and answers with the wrong norm. The table is
+    /// either wholly correct or visibly absent; there is no in-between state a
+    /// search can consume.
+    fn push_sq_norm(&mut self, value: f32) {
+        if self.sq_norms.len() + 1 == self.nodes.len() {
+            self.sq_norms.push(value);
+        } else {
+            self.rebuild_sq_norms();
+        }
+    }
+
+    /// Record the norm of a node written into an existing slot, with the same
+    /// all-or-nothing rule as [`HnswGraph::push_sq_norm`].
+    fn replace_sq_norm(&mut self, idx: usize, value: f32) {
+        if self.sq_norms.len() == self.nodes.len() {
+            self.sq_norms[idx] = value;
+        } else {
+            self.rebuild_sq_norms();
+        }
+    }
+
+    /// Cosine distance from `query` — whose squared norm the caller has already
+    /// computed once for the whole traversal — to the node at `idx`.
+    ///
+    /// Takes the memoized node norm when the table is tracking `nodes`, and
+    /// falls back to the fused kernel when it is not. Both arms return the same
+    /// bits; the memo changes only how much arithmetic runs to produce them.
+    #[inline]
+    fn distance_to_node(&self, query: &[f32], query_sq_norm: f32, idx: usize) -> f32 {
+        let vector = &self.nodes[idx].vector;
+        if self.sq_norms.len() != self.nodes.len() {
+            return cosine_distance(query, vector);
+        }
+        let node_sq_norm = self.sq_norms[idx];
+        debug_assert_eq!(
+            node_sq_norm.to_bits(),
+            squared_norm(vector).to_bits(),
+            "memoized squared norm for node {idx} does not match its vector"
+        );
+        cosine_distance_with_sq_norms(query, query_sq_norm, vector, node_sq_norm)
+    }
+
     /// Sort `(distance, idx)` pairs ascending by distance, breaking ties by the
     /// node's stable key hash rather than by internal index. NaN distances sort
     /// last (via `total_cmp`). Key-based tie-breaks keep neighbor pruning
@@ -879,6 +1128,7 @@ impl<Id: VectorId> HnswGraph<Id> {
         level: usize,
         plan: InsertionPlan,
     ) {
+        let node_sq_norm = squared_norm(vector);
         let node = HnswNode {
             vector: vector.to_vec(),
             connections: vec![Vec::new(); level + 1],
@@ -888,6 +1138,7 @@ impl<Id: VectorId> HnswGraph<Id> {
         // Allocate or reuse an internal index.
         let idx = if let Some(free_idx) = self.free_list.pop() {
             self.nodes[free_idx] = node;
+            self.replace_sq_norm(free_idx, node_sq_norm);
             self.idx_to_id[free_idx] = entity_id;
             if self.backlinks.len() <= free_idx {
                 self.backlinks.resize_with(free_idx + 1, Vec::new);
@@ -897,6 +1148,7 @@ impl<Id: VectorId> HnswGraph<Id> {
         } else {
             let idx = self.nodes.len();
             self.nodes.push(node);
+            self.push_sq_norm(node_sq_norm);
             self.idx_to_id.push(entity_id);
             self.backlinks.push(Vec::new());
             idx
@@ -932,10 +1184,11 @@ impl<Id: VectorId> HnswGraph<Id> {
                     // Prune: keep only the closest nb_m_max neighbors.
                     // Clone data to satisfy the borrow checker.
                     let nb_vec = self.nodes[nb].vector.clone();
+                    let nb_sq_norm = squared_norm(&nb_vec);
                     let conns = self.nodes[nb].connections[lc].clone();
                     let mut scored: Vec<(f32, usize)> = conns
                         .iter()
-                        .map(|&n| (cosine_distance(&nb_vec, &self.nodes[n].vector), n))
+                        .map(|&n| (self.distance_to_node(&nb_vec, nb_sq_norm, n), n))
                         .collect();
                     self.sort_scored_neighbors(&mut scored);
                     let pruned = scored.into_iter().take(nb_m_max).map(|(_, n)| n).collect();
@@ -1035,6 +1288,9 @@ impl<Id: VectorId> HnswGraph<Id> {
         self.nodes[idx].connections.clear();
         self.nodes[idx].vector.clear();
         self.nodes[idx].level = 0;
+        // An empty vector's squared norm is 0.0, which is what `squared_norm`
+        // returns for it — the memo stays exactly what a recompute would give.
+        self.replace_sq_norm(idx, 0.0);
         if idx < self.backlinks.len() {
             self.backlinks[idx].clear();
         }
@@ -1157,11 +1413,333 @@ pub struct RecoveryMarker {
     pub sha256: [u8; 32],
 }
 
+/// Version 1 on-disk container: the whole graph as one MessagePack value.
+///
+/// Superseded by the version 2 container (see [`encode_v2`]), which is what
+/// [`VectorIndex::save`] writes. This type stays public and stays readable
+/// because every index persisted before the v2 cutover is in this shape and
+/// must load without a rebuild; it is written only by tests that need to
+/// produce a legacy file.
+///
+/// MessagePack tags each `f32` with a one-byte `0xca` marker, so a v1 file
+/// spends five bytes per stored dimension and decodes one element at a time.
+/// That is the cost v2 exists to remove.
 #[derive(Serialize, Deserialize)]
 #[serde(bound(serialize = "Id: VectorId", deserialize = "Id: VectorId"))]
 pub struct HnswSnapshot<Id: VectorId = DefaultId> {
     pub format_version: u8,
     pub graph: HnswGraph<Id>,
+}
+
+// ---------------------------------------------------------------------------
+// Version 2 container: MessagePack header + raw contiguous fp32 payload
+// ---------------------------------------------------------------------------
+//
+// Layout:
+//
+//   0..4     magic `KVEC`
+//   4..8     format version, u32 LE
+//   8..16    header byte length, u64 LE
+//   16..24   payload offset, u64 LE (multiple of `KVEC_V2_PAYLOAD_ALIGN`)
+//   24..32   payload slot count, u64 LE
+//   32..40   dimensions, u64 LE
+//   40..64   reserved, zero
+//   64..     header (MessagePack `KvecHeaderV2`)
+//            zero padding to the payload offset
+//            payload: slot-major little-endian f32, `dimensions` per slot
+//
+// The floats are bit-identical to what v1 stored. Only the serialization
+// changes: no per-element type tag on disk, and no per-element decode on load.
+//
+// Version detection is a byte comparison and is unambiguous in both
+// directions. A v1 file is a MessagePack two-element array, so its first byte
+// is `0x92`; a v2 file's is `0x4B` (`K`). A reader that predates v2 therefore
+// hands `0x4B` to `rmp_serde` as a positive fixint, which cannot deserialize
+// into a struct, and the load fails loudly instead of misreading a header as
+// vectors. That failure is what routes an older binary into the caller's
+// archive-and-rebuild path rather than into silently-wrong neighbors.
+
+const KVEC_V2_MAGIC: [u8; 4] = *b"KVEC";
+const KVEC_V2_VERSION: u32 = 2;
+const KVEC_V2_PREAMBLE_LEN: usize = 64;
+
+/// Payload alignment. Only 4 is required to address the block as `f32`; 64
+/// keeps each mapping's payload start on a cache line, and on the mmap read
+/// path the file offset is what decides that alignment because the mapping
+/// base is always page-aligned.
+const KVEC_V2_PAYLOAD_ALIGN: usize = 64;
+
+/// Per-node header entry. Carries everything about a node except its vector,
+/// which lives in the raw payload at `payload_slot`.
+#[derive(Serialize, Deserialize)]
+struct KvecNodeV2 {
+    connections: Vec<Vec<usize>>,
+    level: usize,
+    /// Slot index into the raw payload block, or `None` for a slot whose vector
+    /// was cleared by removal. Removed slots consume no payload bytes, so a
+    /// heavily churned index does not carry its free list as dead fp32.
+    payload_slot: Option<u64>,
+}
+
+/// Version 2 header. Every field of [`HnswGraph`] that is not a vector and not
+/// `#[serde(skip)]`, in the same meaning as v1.
+///
+/// `descriptor` is carried verbatim. The container version above is a property
+/// of the file encoding and is deliberately kept out of the descriptor: the
+/// descriptor answers "which model and which graph produced these vectors",
+/// and folding an encoding revision into that identity would discard a whole
+/// index on a change that cannot alter a single float.
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "Id: VectorId", deserialize = "Id: VectorId"))]
+struct KvecHeaderV2<Id: VectorId = DefaultId> {
+    nodes: Vec<KvecNodeV2>,
+    entry_point: Option<usize>,
+    max_level: usize,
+    dimensions: usize,
+    #[serde(serialize_with = "serialize_id_to_idx_canonical")]
+    id_to_idx: HashMap<Id, usize>,
+    idx_to_id: Vec<Id>,
+    free_list: Vec<usize>,
+    reserved_legacy_slot: u64,
+    descriptor: IndexDescriptor,
+}
+
+/// What a load actually paid, in bytes and element decodes.
+///
+/// Every field is a count taken from the load itself, not a timing, so it is
+/// reproducible on a busy machine and comparable across formats.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KvecLoadStats {
+    /// Container version the bytes were read as: 1 or 2.
+    pub format_version: u32,
+    /// Size of the index file.
+    pub file_bytes: u64,
+    /// Bytes made addressable by a memory mapping rather than copied to the heap.
+    pub bytes_mapped: u64,
+    /// Bytes copied into a heap buffer before decoding. Zero when the file was
+    /// mapped; the whole file when a mapping was unavailable and it was read.
+    pub bytes_read_into_heap: u64,
+    /// Bytes handed to the MessagePack decoder. For v2 this is the header
+    /// alone, so it excludes the vector payload entirely.
+    pub bytes_decoded: u64,
+    /// Bytes of raw fp32 payload copied out of the container into node vectors.
+    /// Zero for v1, where vectors arrive through the MessagePack decoder.
+    pub vector_payload_bytes: u64,
+    /// Individual `f32` values the MessagePack decoder had to read a type tag
+    /// for. This is the per-element cost v2 removes, and it is zero for v2.
+    pub msgpack_float_decodes: u64,
+    /// Number of stored vectors.
+    pub vector_slots: u64,
+}
+
+fn align_up(value: usize, align: usize) -> usize {
+    value.div_ceil(align) * align
+}
+
+/// True when `bytes` opens a version 2 container.
+fn is_v2_container(bytes: &[u8]) -> bool {
+    bytes.len() >= KVEC_V2_PREAMBLE_LEN && bytes[..4] == KVEC_V2_MAGIC
+}
+
+fn read_u64_le(bytes: &[u8], at: usize) -> u64 {
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&bytes[at..at + 8]);
+    u64::from_le_bytes(buf)
+}
+
+/// Serialize `graph` into a version 2 container.
+fn encode_v2<Id: VectorId>(graph: &HnswGraph<Id>) -> Result<Vec<u8>, VectorError> {
+    let dimensions = graph.dimensions;
+    let mut nodes = Vec::with_capacity(graph.nodes.len());
+    // Node index of each payload slot, in slot order.
+    let mut slot_sources: Vec<usize> = Vec::with_capacity(graph.nodes.len());
+
+    for (idx, node) in graph.nodes.iter().enumerate() {
+        let payload_slot = if node.vector.is_empty() {
+            None
+        } else {
+            // A fixed stride is what makes the payload addressable by slot, so a
+            // node whose vector disagrees with the graph's dimensionality has to
+            // stop the write rather than corrupt every later slot's offset.
+            if node.vector.len() != dimensions {
+                return Err(VectorError::IndexError(format!(
+                    "node {idx} holds {} dimensions but the graph declares {dimensions}",
+                    node.vector.len()
+                )));
+            }
+            let slot = slot_sources.len() as u64;
+            slot_sources.push(idx);
+            Some(slot)
+        };
+        nodes.push(KvecNodeV2 {
+            connections: node.connections.clone(),
+            level: node.level,
+            payload_slot,
+        });
+    }
+
+    let header = KvecHeaderV2 {
+        nodes,
+        entry_point: graph.entry_point,
+        max_level: graph.max_level,
+        dimensions,
+        id_to_idx: graph.id_to_idx.clone(),
+        idx_to_id: graph.idx_to_id.clone(),
+        free_list: graph.free_list.clone(),
+        reserved_legacy_slot: graph.reserved_legacy_slot,
+        descriptor: graph.descriptor.clone(),
+    };
+    let header_bytes = rmp_serde::to_vec(&header).map_err(|e| {
+        VectorError::IndexError(format!("failed to serialize HNSW index header: {e}"))
+    })?;
+
+    let payload_offset = align_up(
+        KVEC_V2_PREAMBLE_LEN + header_bytes.len(),
+        KVEC_V2_PAYLOAD_ALIGN,
+    );
+    let payload_len = slot_sources
+        .len()
+        .checked_mul(dimensions)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| {
+            VectorError::IndexError("HNSW payload size overflows a usize".to_string())
+        })?;
+
+    let mut out = vec![0u8; payload_offset + payload_len];
+    out[0..4].copy_from_slice(&KVEC_V2_MAGIC);
+    out[4..8].copy_from_slice(&KVEC_V2_VERSION.to_le_bytes());
+    out[8..16].copy_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+    out[16..24].copy_from_slice(&(payload_offset as u64).to_le_bytes());
+    out[24..32].copy_from_slice(&(slot_sources.len() as u64).to_le_bytes());
+    out[32..40].copy_from_slice(&(dimensions as u64).to_le_bytes());
+    out[KVEC_V2_PREAMBLE_LEN..KVEC_V2_PREAMBLE_LEN + header_bytes.len()]
+        .copy_from_slice(&header_bytes);
+
+    let stride = dimensions * 4;
+    for (slot, &idx) in slot_sources.iter().enumerate() {
+        let start = payload_offset + slot * stride;
+        let dst = &mut out[start..start + stride];
+        // Little-endian regardless of host byte order, so an index written on
+        // one architecture reads back identically on another.
+        for (chunk, value) in dst.chunks_exact_mut(4).zip(graph.nodes[idx].vector.iter()) {
+            chunk.copy_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    Ok(out)
+}
+
+/// Deserialize a version 2 container.
+fn decode_v2<Id: VectorId>(bytes: &[u8]) -> Result<(HnswGraph<Id>, KvecLoadStats), VectorError> {
+    let malformed =
+        |what: &str| VectorError::IndexError(format!("malformed kvec container: {what}"));
+
+    if bytes.len() < KVEC_V2_PREAMBLE_LEN {
+        return Err(malformed("shorter than its preamble"));
+    }
+    let version = {
+        let mut buf = [0u8; 4];
+        buf.copy_from_slice(&bytes[4..8]);
+        u32::from_le_bytes(buf)
+    };
+    if version != KVEC_V2_VERSION {
+        return Err(VectorError::IndexError(format!(
+            "unsupported kvec container version {version}"
+        )));
+    }
+
+    let header_len = read_u64_le(bytes, 8) as usize;
+    let payload_offset = read_u64_le(bytes, 16) as usize;
+    let slot_count = read_u64_le(bytes, 24) as usize;
+    let dimensions = read_u64_le(bytes, 32) as usize;
+
+    let header_end = KVEC_V2_PREAMBLE_LEN
+        .checked_add(header_len)
+        .ok_or_else(|| malformed("header length overflows"))?;
+    if header_end > bytes.len() || payload_offset < header_end {
+        return Err(malformed("header does not fit before the payload"));
+    }
+    let stride = dimensions
+        .checked_mul(4)
+        .ok_or_else(|| malformed("dimensions overflow a byte stride"))?;
+    let payload_len = slot_count
+        .checked_mul(stride)
+        .ok_or_else(|| malformed("payload size overflows"))?;
+    let payload_end = payload_offset
+        .checked_add(payload_len)
+        .ok_or_else(|| malformed("payload extent overflows"))?;
+    if payload_end > bytes.len() {
+        return Err(malformed("payload extends past the end of the file"));
+    }
+
+    let header: KvecHeaderV2<Id> = rmp_serde::from_slice(&bytes[KVEC_V2_PREAMBLE_LEN..header_end])
+        .map_err(|e| VectorError::IndexError(format!("failed to deserialize kvec header: {e}")))?;
+    // The preamble is what bounds-checking above trusted; the header is what the
+    // graph is built from. They are written together and must agree.
+    if header.dimensions != dimensions {
+        return Err(malformed(
+            "header dimensions disagree with the container preamble",
+        ));
+    }
+
+    let payload = &bytes[payload_offset..payload_end];
+    let mut nodes = Vec::with_capacity(header.nodes.len());
+    for (idx, entry) in header.nodes.iter().enumerate() {
+        let vector = match entry.payload_slot {
+            None => Vec::new(),
+            Some(slot) => {
+                let slot = slot as usize;
+                if slot >= slot_count {
+                    return Err(malformed(&format!(
+                        "node {idx} names payload slot {slot} of {slot_count}"
+                    )));
+                }
+                let start = slot * stride;
+                let mut vector = vec![0f32; dimensions];
+                for (dst, chunk) in vector
+                    .iter_mut()
+                    .zip(payload[start..start + stride].chunks_exact(4))
+                {
+                    *dst = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                }
+                vector
+            }
+        };
+        nodes.push(HnswNode {
+            vector,
+            connections: entry.connections.clone(),
+            level: entry.level,
+        });
+    }
+
+    let mut graph = HnswGraph {
+        nodes,
+        entry_point: header.entry_point,
+        max_level: header.max_level,
+        dimensions,
+        id_to_idx: header.id_to_idx,
+        idx_to_id: header.idx_to_id,
+        free_list: header.free_list,
+        reserved_legacy_slot: header.reserved_legacy_slot,
+        descriptor: header.descriptor,
+        backlinks: Vec::new(),
+        canonical_order_dirty: false,
+        sq_norms: Vec::new(),
+    };
+    graph.rebuild_backlinks();
+    graph.rebuild_sq_norms();
+
+    let stats = KvecLoadStats {
+        format_version: KVEC_V2_VERSION,
+        file_bytes: bytes.len() as u64,
+        bytes_mapped: 0,
+        bytes_read_into_heap: 0,
+        bytes_decoded: header_len as u64,
+        vector_payload_bytes: payload_len as u64,
+        msgpack_float_decodes: 0,
+        vector_slots: slot_count as u64,
+    };
+    Ok((graph, stats))
 }
 
 fn recovery_tmp_path(path: &Path) -> PathBuf {
@@ -1445,7 +2023,8 @@ fn atomic_save_bytes(path: &Path, bytes: &[u8], label: &str) -> Result<(), Vecto
     promote_recovery_candidate(path)
 }
 
-fn try_load_snapshot<Id: VectorId>(bytes: &[u8]) -> Result<HnswGraph<Id>, VectorError> {
+/// Deserialize a version 1 container: the whole graph as one MessagePack value.
+fn decode_v1<Id: VectorId>(bytes: &[u8]) -> Result<(HnswGraph<Id>, KvecLoadStats), VectorError> {
     let snapshot: HnswSnapshot<Id> = rmp_serde::from_slice(bytes).map_err(|e| {
         VectorError::IndexError(format!("failed to deserialize HNSW snapshot: {e}"))
     })?;
@@ -1457,7 +2036,114 @@ fn try_load_snapshot<Id: VectorId>(bytes: &[u8]) -> Result<HnswGraph<Id>, Vector
     }
     let mut graph = snapshot.graph;
     graph.rebuild_backlinks();
-    Ok(graph)
+    graph.rebuild_sq_norms();
+
+    // Every stored dimension arrived through the MessagePack decoder as its own
+    // tagged element, so the count of stored dimensions IS the count of tagged
+    // element decodes this load performed.
+    let msgpack_float_decodes: u64 = graph.nodes.iter().map(|n| n.vector.len() as u64).sum();
+    let vector_slots = graph.nodes.iter().filter(|n| !n.vector.is_empty()).count() as u64;
+    let stats = KvecLoadStats {
+        format_version: HNSW_FORMAT_VERSION as u32,
+        file_bytes: bytes.len() as u64,
+        bytes_mapped: 0,
+        bytes_read_into_heap: 0,
+        bytes_decoded: bytes.len() as u64,
+        vector_payload_bytes: 0,
+        msgpack_float_decodes,
+        vector_slots,
+    };
+    Ok((graph, stats))
+}
+
+/// Deserialize either container version, chosen by the bytes themselves.
+///
+/// A version 1 file has no magic to check, so v2 is identified positively and
+/// anything else is offered to the v1 decoder. That ordering is what keeps
+/// every index written before the cutover loadable without a rebuild.
+fn decode_container<Id: VectorId>(
+    bytes: &[u8],
+) -> Result<(HnswGraph<Id>, KvecLoadStats), VectorError> {
+    if is_v2_container(bytes) {
+        decode_v2(bytes)
+    } else {
+        decode_v1(bytes)
+    }
+}
+
+fn try_load_snapshot<Id: VectorId>(bytes: &[u8]) -> Result<HnswGraph<Id>, VectorError> {
+    decode_container(bytes).map(|(graph, _)| graph)
+}
+
+/// An index file's bytes, made addressable for decoding.
+///
+/// Mapping is preferred over reading because the v2 payload is decoded straight
+/// out of the container: reading would copy the whole file to the heap first
+/// and then copy the vectors again out of that copy, so on a store whose bytes
+/// are overwhelmingly vector payload the read buffer is pure overhead.
+enum LoadedContainer {
+    Mapped(memmap2::Mmap),
+    Read(Vec<u8>),
+}
+
+impl LoadedContainer {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            LoadedContainer::Mapped(map) => &map[..],
+            LoadedContainer::Read(bytes) => bytes,
+        }
+    }
+
+    /// Record how the bytes were obtained on stats the decoder filled in.
+    fn account(&self, stats: KvecLoadStats) -> KvecLoadStats {
+        let len = self.bytes().len() as u64;
+        match self {
+            LoadedContainer::Mapped(_) => KvecLoadStats {
+                bytes_mapped: len,
+                ..stats
+            },
+            LoadedContainer::Read(_) => KvecLoadStats {
+                bytes_read_into_heap: len,
+                ..stats
+            },
+        }
+    }
+}
+
+/// Make an index file's bytes addressable, by mapping where possible.
+///
+/// Falls back to a plain read whenever a mapping cannot be established — an
+/// empty file, or a filesystem that refuses the mapping. The fallback decodes
+/// the identical bytes and differs only in what it charges to the heap, so a
+/// refused mapping costs speed and never correctness.
+fn open_container(path: &Path) -> Result<LoadedContainer, VectorError> {
+    let file = File::open(path).map_err(|e| {
+        VectorError::IndexError(format!(
+            "failed to load vector index from {}: {e}",
+            path.display()
+        ))
+    })?;
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if len > 0 {
+        // SAFETY: index files are replaced by writing a candidate beside them and
+        // renaming over the path, so the inode behind an established mapping is
+        // never written in place and a concurrent save cannot change these bytes.
+        // A mapping outlives that rename harmlessly, holding the pre-save
+        // content. The residual hazard is an outside process truncating the file
+        // under the mapping, which the write lock does not cover and which no
+        // read strategy here can defend against.
+        match unsafe { memmap2::Mmap::map(&file) } {
+            Ok(map) => return Ok(LoadedContainer::Mapped(map)),
+            Err(_) => { /* fall through to the read path */ }
+        }
+    }
+    let bytes = fs::read(path).map_err(|e| {
+        VectorError::IndexError(format!(
+            "failed to load vector index from {}: {e}",
+            path.display()
+        ))
+    })?;
+    Ok(LoadedContainer::Read(bytes))
 }
 
 fn recover_from_tmp<Id: VectorId>(
@@ -1535,6 +2221,9 @@ pub struct VectorIndex<Id: VectorId = DefaultId> {
     graph: RwLock<HnswGraph<Id>>,
     /// Optional path for persisting the index to disk.
     persistence_path: RwLock<Option<PathBuf>>,
+    /// What the load that produced this index cost, in bytes and element
+    /// decodes. `None` for an index that was built rather than loaded.
+    load_stats: Option<KvecLoadStats>,
 }
 
 impl<Id: VectorId> VectorIndex<Id> {
@@ -1558,7 +2247,14 @@ impl<Id: VectorId> VectorIndex<Id> {
         Ok(Self {
             graph: RwLock::new(HnswGraph::new(dimensions)),
             persistence_path: RwLock::new(None),
+            load_stats: None,
         })
+    }
+
+    /// What the load that produced this index cost, in bytes and element
+    /// decodes, or `None` for an index that was built rather than loaded.
+    pub fn load_stats(&self) -> Option<KvecLoadStats> {
+        self.load_stats
     }
 
     /// Create a new index, stamping its self-description (model identity + graph
@@ -1855,8 +2551,13 @@ impl<Id: VectorId> VectorIndex<Id> {
 
     /// Save the HNSW index to disk.
     ///
-    /// Persists the full HNSW graph as a single MessagePack file with atomic
+    /// Persists the full HNSW graph as a version 2 container — a MessagePack
+    /// header followed by a contiguous little-endian fp32 payload — with atomic
     /// write semantics (write-to-tmp then rename).
+    ///
+    /// Every save writes v2, so an index that was loaded from a v1 file
+    /// migrates on its next full write with no rebuild and no re-embed: the
+    /// vectors are already in hand and only their encoding changes.
     pub fn save(&self, path: &Path) -> Result<(), VectorError> {
         let _span = tracing::info_span!(
             "kin_vector.save",
@@ -1867,14 +2568,8 @@ impl<Id: VectorId> VectorIndex<Id> {
         // lock, then release the lock BEFORE the heavy serialize + fsync so the
         // GPU-fed upsert path is not blocked by index IO. Concurrent upserts after
         // this point simply land in the next save.
-        let snapshot = self.with_canonical_graph(|graph| {
-            Ok(HnswSnapshot {
-                format_version: HNSW_FORMAT_VERSION,
-                graph: graph.clone_for_persist(),
-            })
-        })?;
-        let bytes = rmp_serde::to_vec(&snapshot)
-            .map_err(|e| VectorError::IndexError(format!("failed to serialize HNSW index: {e}")))?;
+        let graph = self.with_canonical_graph(|graph| Ok(graph.clone_for_persist()))?;
+        let bytes = encode_v2(&graph)?;
         atomic_save_bytes(path, &bytes, "vector index")
     }
 
@@ -1954,24 +2649,27 @@ impl<Id: VectorId> VectorIndex<Id> {
             path = %path.display()
         )
         .entered();
-        let graph = if path.exists() {
-            let bytes = fs::read(path).map_err(|e| {
-                VectorError::IndexError(format!(
-                    "failed to load vector index from {}: {e}",
-                    path.display()
-                ))
-            })?;
-            match try_load_snapshot(&bytes) {
-                Ok(g) => g,
-                Err(err) => recover_from_tmp(path, Some(&err))?,
+        let (graph, load_stats) = if path.exists() {
+            // Scoped so the mapping is released before any recovery runs.
+            // Recovery renames the candidate over this path, and Windows refuses
+            // to replace a file that still has a mapping open on it.
+            let decoded = {
+                let container = open_container(path)?;
+                decode_container(container.bytes())
+                    .map(|(graph, stats)| (graph, container.account(stats)))
+            };
+            match decoded {
+                Ok((graph, stats)) => (graph, Some(stats)),
+                Err(err) => (recover_from_tmp(path, Some(&err))?, None),
             }
         } else {
-            recover_from_tmp(path, None)?
+            (recover_from_tmp(path, None)?, None)
         };
 
         Ok(Self {
             graph: RwLock::new(graph),
             persistence_path: RwLock::new(Some(path.to_path_buf())),
+            load_stats,
         })
     }
 }
@@ -2740,6 +3438,7 @@ mod tests {
         let vi = VectorIndex::<u64> {
             graph: RwLock::new(graph),
             persistence_path: RwLock::new(None),
+            load_stats: None,
         };
         vi.save(&path).unwrap();
 
@@ -3357,6 +4056,328 @@ mod tests {
         );
     }
 
+    /// A workload for the memoization parity tests: deterministic pseudo-random
+    /// vectors across the dimensions that exercise every branch of both kernels
+    /// (the four-lane body, each `len % 4` tail length, and the 768-d production
+    /// shape), each pair scaled to a spread of magnitudes.
+    ///
+    /// Non-unit vectors are the point. kin-vector stores whatever `upsert` is
+    /// handed, so a memo that quietly assumed unit length would agree with the
+    /// fused kernel on normalized input and diverge everywhere else. Half these
+    /// cases have norms far from 1, and the near-zero, denormal, all-zero, and
+    /// overflow-to-infinity cases pin the degenerate-denominator behavior.
+    fn norm_memo_cases() -> Vec<(Vec<f32>, Vec<f32>)> {
+        fn vec_for(seed: u64, dim: usize) -> Vec<f32> {
+            (0..dim)
+                .map(|d| {
+                    let h = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add((d as u64).wrapping_mul(1442695040888963407))
+                        .wrapping_add(0x9E3779B97F4A7C15);
+                    ((h >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0
+                })
+                .collect()
+        }
+        fn scaled(v: &[f32], k: f32) -> Vec<f32> {
+            v.iter().map(|x| x * k).collect()
+        }
+        fn unit(v: &[f32]) -> Vec<f32> {
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if n > 1e-12 {
+                v.iter().map(|x| x / n).collect()
+            } else {
+                v.to_vec()
+            }
+        }
+
+        let mut cases: Vec<(Vec<f32>, Vec<f32>)> = Vec::new();
+        for &dim in &[1usize, 2, 3, 4, 5, 6, 7, 8, 31, 48, 127, 768] {
+            let a = vec_for(dim as u64 * 2, dim);
+            let b = vec_for(dim as u64 * 2 + 1, dim);
+            // Wildly different magnitudes on each side, including one vector far
+            // longer than the other.
+            for &(ka, kb) in &[
+                (1.0f32, 1.0f32),
+                (1e-3, 1e3),
+                (3.7, 0.017),
+                (1e4, 1e4),
+                (2.0, 1.0),
+            ] {
+                cases.push((scaled(&a, ka), scaled(&b, kb)));
+            }
+            // The normalized shape the embedding pipeline actually produces.
+            cases.push((unit(&a), unit(&b)));
+            // Identical, opposite, and mixed-normalization pairs.
+            let v = vec_for(99 + dim as u64, dim);
+            cases.push((v.clone(), v.clone()));
+            cases.push((unit(&v), scaled(&v, 512.0)));
+            let neg: Vec<f32> = v.iter().map(|x| -x).collect();
+            cases.push((v, neg));
+            // Degenerate denominators and extreme magnitudes.
+            cases.push((vec![1e-30f32; dim], vec![1e-30f32; dim]));
+            cases.push((vec![f32::from_bits(1); dim], vec![f32::from_bits(3); dim]));
+            cases.push((vec![0.0f32; dim], vec![0.0f32; dim]));
+            cases.push((vec![0.0f32; dim], scaled(&a, 5.0)));
+            cases.push((vec![1e30f32; dim], vec![1e30f32; dim]));
+        }
+        cases
+    }
+
+    /// THE claim this change rests on: a cosine distance assembled from a
+    /// separately-computed dot product and two separately-computed squared norms
+    /// is the SAME BITS as the fused kernel it replaces — not close, identical.
+    ///
+    /// Exact equality, never a tolerance. The fused kernel runs three independent
+    /// accumulator chains over one pass; lifting a chain into its own loop
+    /// reproduces its operation sequence exactly and reassociates nothing, so any
+    /// difference at all would mean the split kernels had drifted from the fused
+    /// ones and the memo could shift a ranking. A tolerance would hide precisely
+    /// the regression this exists to catch.
+    ///
+    /// Both public entry points are compared through whichever kernel this
+    /// process resolved; `memoized_kernels_are_bit_identical_to_fused_kernels`
+    /// covers each kernel directly, so neither arm depends on the ambient gate.
+    #[test]
+    fn memoized_cosine_is_bit_identical_to_fused_cosine() {
+        let cases = norm_memo_cases();
+        for (a, b) in &cases {
+            let fused = cosine_distance(a, b);
+            let memoized = cosine_distance_with_sq_norms(a, squared_norm(a), b, squared_norm(b));
+            assert_eq!(
+                fused.to_bits(),
+                memoized.to_bits(),
+                "memoized cosine differs from fused cosine at dim {}: \
+                 fused={fused:?} memoized={memoized:?}",
+                a.len()
+            );
+        }
+        // Empty operands take the same degenerate branch. The mismatched-length
+        // branch is not exercised here: both entry points `debug_assert` equal
+        // lengths before the runtime guard, so a debug build panics before
+        // reaching it. The guard stays a release-build backstop in both.
+        assert_eq!(
+            cosine_distance(&[], &[]).to_bits(),
+            cosine_distance_with_sq_norms(&[], 0.0, &[], 0.0).to_bits()
+        );
+        eprintln!(
+            "[norm-memo] memoized == fused, bit-exact, over {} cases",
+            cases.len()
+        );
+    }
+
+    /// The same claim held against EACH kernel directly rather than whichever one
+    /// the process-global `KIN_VECTOR_SIMD` gate resolved. The gate is sampled
+    /// once per process, so a test that only went through the public entry point
+    /// would leave one kernel's split-vs-fused parity unproven in any single run.
+    #[test]
+    fn memoized_kernels_are_bit_identical_to_fused_kernels() {
+        for (a, b) in &norm_memo_cases() {
+            let fused = cosine_distance_scalar(a, b);
+            let split = cosine_from_parts(
+                dot_scalar(a, b),
+                squared_norm_scalar(a),
+                squared_norm_scalar(b),
+            );
+            assert_eq!(
+                fused.to_bits(),
+                split.to_bits(),
+                "scalar split kernels differ from the fused scalar kernel at dim {}",
+                a.len()
+            );
+
+            #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+            {
+                // SAFETY: NEON is part of the mandatory aarch64 baseline.
+                let (fused_neon, split_neon) = unsafe {
+                    (
+                        cosine_distance_neon(a, b),
+                        cosine_from_parts(
+                            dot_neon(a, b),
+                            squared_norm_neon(a),
+                            squared_norm_neon(b),
+                        ),
+                    )
+                };
+                assert_eq!(
+                    fused_neon.to_bits(),
+                    split_neon.to_bits(),
+                    "NEON split kernels differ from the fused NEON kernel at dim {}",
+                    a.len()
+                );
+            }
+        }
+    }
+
+    /// `squared_norm` must reproduce the norm accumulator of the kernel that will
+    /// consume it — including on a query whose length is not a multiple of four,
+    /// where the tail rounds differently from the lanes.
+    #[test]
+    fn squared_norm_matches_the_kernel_norm_accumulators() {
+        for (a, _) in &norm_memo_cases() {
+            let mut sequential = 0.0f32;
+            for &x in a {
+                sequential += x * x;
+            }
+            assert_eq!(
+                squared_norm_scalar(a).to_bits(),
+                sequential.to_bits(),
+                "scalar squared_norm is not the sequential sum of squares at dim {}",
+                a.len()
+            );
+            // A vector's cosine distance to itself is `1 - dot/sqrt(n*n)`, so
+            // feeding `squared_norm` back in must land on the fused self-distance.
+            assert_eq!(
+                cosine_distance(a, a).to_bits(),
+                cosine_distance_with_sq_norms(a, squared_norm(a), a, squared_norm(a)).to_bits(),
+                "self-distance diverges at dim {}",
+                a.len()
+            );
+        }
+    }
+
+    /// The memo is a side table indexed in parallel with `nodes`, so the risk it
+    /// carries is going stale rather than being wrong on day one. This walks the
+    /// mutations that can desynchronize it — insert, overwrite, remove, reuse of a
+    /// freed slot, compaction, and a save/load round trip — and after each one
+    /// asserts every entry still equals a fresh recompute, bit for bit.
+    #[test]
+    fn memoized_norms_track_the_graph_through_its_mutations() {
+        fn assert_memo_exact<Id: VectorId>(graph: &HnswGraph<Id>, after: &str) {
+            assert_eq!(
+                graph.sq_norms.len(),
+                graph.nodes.len(),
+                "memo length diverged from nodes after {after}"
+            );
+            for (idx, node) in graph.nodes.iter().enumerate() {
+                assert_eq!(
+                    graph.sq_norms[idx].to_bits(),
+                    squared_norm(&node.vector).to_bits(),
+                    "memo for node {idx} is stale after {after}"
+                );
+            }
+        }
+
+        // Deliberately NOT unit vectors: the memo has to carry real norms.
+        let dim = 8;
+        let vector_for = |k: u64| -> Vec<f32> {
+            (0..dim)
+                .map(|d| ((k * 31 + d as u64 % 7) as f32 + 0.5) * (1.0 + k as f32))
+                .collect()
+        };
+
+        let index: VectorIndex<u64> = VectorIndex::new(dim).unwrap();
+        for k in 0..24u64 {
+            index.upsert(k, &vector_for(k)).unwrap();
+        }
+        assert_memo_exact(&index.graph.read(), "inserts");
+
+        // Overwrite an existing key: remove + insert into the freed slot.
+        index.upsert(7, &vector_for(700)).unwrap();
+        assert_memo_exact(&index.graph.read(), "overwrite");
+
+        // Remove several, then insert new keys so freed slots are reused.
+        for k in [2u64, 11, 19] {
+            index.remove(&k).unwrap();
+        }
+        assert_memo_exact(&index.graph.read(), "removals");
+        for k in 100..104u64 {
+            index.upsert(k, &vector_for(k)).unwrap();
+        }
+        assert_memo_exact(&index.graph.read(), "free-slot reuse");
+
+        index.compact().unwrap();
+        assert_memo_exact(&index.graph.read(), "compact");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graph.kvec");
+        index.save(&path).unwrap();
+        let reloaded: VectorIndex<u64> = VectorIndex::load_from_disk(&path).unwrap();
+        assert_memo_exact(&reloaded.graph.read(), "load from disk");
+
+        // A graph whose `nodes` were written directly leaves the memo absent, and
+        // the distance path must fall back rather than read unset entries.
+        let mut hand_built: HnswGraph<u64> = HnswGraph::new(dim);
+        hand_built.nodes = vec![HnswNode {
+            vector: vector_for(5),
+            connections: vec![Vec::new()],
+            level: 0,
+        }];
+        hand_built.idx_to_id = vec![5];
+        hand_built.id_to_idx.insert(5, 0);
+        hand_built.entry_point = Some(0);
+        assert!(hand_built.sq_norms.is_empty(), "memo must start absent");
+        let query = vector_for(3);
+        assert_eq!(
+            hand_built
+                .distance_to_node(&query, squared_norm(&query), 0)
+                .to_bits(),
+            cosine_distance(&query, &hand_built.nodes[0].vector).to_bits(),
+            "absent memo must fall back to the fused kernel"
+        );
+    }
+
+    /// End to end: the memo must not move a single result bit. The same index is
+    /// queried twice — once with the memo populated, once with it cleared so every
+    /// distance runs through the fused kernel — and the two result lists must
+    /// match exactly, ids and distances alike.
+    #[test]
+    fn search_results_are_bit_identical_with_and_without_the_memo() {
+        let dim = 16;
+        let vector_for = |k: u64| -> Vec<f32> {
+            (0..dim)
+                .map(|d| {
+                    let h = k
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add((d as u64).wrapping_mul(1442695040888963407));
+                    // Scale varies per key so stored vectors are emphatically not
+                    // unit length.
+                    ((h >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * (1.0 + (k % 9) as f32)
+                })
+                .collect()
+        };
+
+        let index: VectorIndex<u64> = VectorIndex::new(dim).unwrap();
+        for k in 0..200u64 {
+            index.upsert(k, &vector_for(k)).unwrap();
+        }
+        for k in [3u64, 44, 91, 150] {
+            index.remove(&k).unwrap();
+        }
+
+        let queries: Vec<Vec<f32>> = (900..916u64).map(vector_for).collect();
+
+        let with_memo: Vec<Vec<(u64, f32)>> = queries
+            .iter()
+            .map(|q| index.search_similar(q, 10).unwrap())
+            .collect();
+
+        index.graph.write().sq_norms.clear();
+        let without_memo: Vec<Vec<(u64, f32)>> = queries
+            .iter()
+            .map(|q| index.search_similar(q, 10).unwrap())
+            .collect();
+
+        assert!(
+            with_memo.iter().any(|r| !r.is_empty()),
+            "corpus produced no results — the comparison would be vacuous"
+        );
+        for (qi, (memo, fused)) in with_memo.iter().zip(&without_memo).enumerate() {
+            assert_eq!(
+                memo.len(),
+                fused.len(),
+                "query {qi}: result count differs with and without the memo"
+            );
+            for (rank, ((id_m, d_m), (id_f, d_f))) in memo.iter().zip(fused).enumerate() {
+                assert_eq!(id_m, id_f, "query {qi} rank {rank}: id differs");
+                assert_eq!(
+                    d_m.to_bits(),
+                    d_f.to_bits(),
+                    "query {qi} rank {rank}: distance differs ({d_m:?} vs {d_f:?})"
+                );
+            }
+        }
+    }
+
     /// CPU-efficiency measurement for KIN_VECTOR_SIMD: wall-clock ns/op for the
     /// scalar vs NEON cosine-distance kernel over a fixed, deterministic workload,
     /// and the speedup ratio. This is the perf half of the graduation evidence —
@@ -3947,5 +4968,361 @@ mod tests {
             recall_post > 0.6,
             "post-compact recall {recall_post:.3} should be reasonable"
         );
+    }
+
+    // -- container format ----------------------------------------------------
+
+    /// Build a populated index with a stamped descriptor and a removal, so the
+    /// container tests exercise live slots, a freed slot, and identity together.
+    fn container_fixture(n: u64, dim: usize) -> VectorIndex<u64> {
+        let idx = VectorIndex::<u64>::new(dim).unwrap();
+        idx.upsert_batch((0..n).map(|k| (k, batch_test_vec(k, dim))).collect())
+            .unwrap();
+        idx.remove(&(n / 2)).unwrap();
+        idx.set_descriptor(descriptor("test-model@1", "root-abcdef"));
+        idx
+    }
+
+    /// Serialize a graph the way the version 1 writer did, so the tests have a
+    /// genuine legacy file to read rather than an imagined one.
+    fn encode_v1(index: &VectorIndex<u64>) -> Vec<u8> {
+        let graph = index
+            .with_canonical_graph(|graph| Ok(graph.clone_for_persist()))
+            .unwrap();
+        rmp_serde::to_vec(&HnswSnapshot {
+            format_version: HNSW_FORMAT_VERSION,
+            graph,
+        })
+        .unwrap()
+    }
+
+    fn vectors_by_id(index: &VectorIndex<u64>) -> Vec<(u64, Vec<f32>)> {
+        let mut keys = index.keys();
+        keys.sort_unstable();
+        keys.into_iter()
+            .map(|k| (k, index.get(&k).expect("live key has a vector")))
+            .collect()
+    }
+
+    /// Compare vectors by their bit patterns, not by approximate equality. The
+    /// whole claim of the format change is that it moves the same `f32` values
+    /// through a different encoding, and `==` on floats would accept a `-0.0`
+    /// for a `0.0` while `to_bits` will not.
+    fn assert_vectors_bit_identical(left: &[(u64, Vec<f32>)], right: &[(u64, Vec<f32>)]) {
+        assert_eq!(left.len(), right.len(), "live key count");
+        for ((lk, lv), (rk, rv)) in left.iter().zip(right.iter()) {
+            assert_eq!(lk, rk, "key order");
+            assert_eq!(lv.len(), rv.len(), "dimension count for key {lk}");
+            for (d, (a, b)) in lv.iter().zip(rv.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "key {lk} dimension {d}: {a:?} vs {b:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn save_writes_a_v2_container_that_reloads_bit_identically() {
+        let dim = 24;
+        let idx = container_fixture(300, dim);
+        let before = vectors_by_id(&idx);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("idx.kvec");
+        idx.save(&path).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..4], &KVEC_V2_MAGIC, "save must write the v2 magic");
+        assert!(is_v2_container(&bytes));
+        assert_eq!(
+            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            KVEC_V2_VERSION
+        );
+
+        let loaded = VectorIndex::<u64>::load_from_disk(&path).unwrap();
+        assert_vectors_bit_identical(&before, &vectors_by_id(&loaded));
+
+        // Topology, not just payload: the same query must reach the same
+        // neighbors in the same order.
+        let probe = batch_test_vec(7, dim);
+        assert_eq!(
+            idx.search_similar(&probe, 10).unwrap(),
+            loaded.search_similar(&probe, 10).unwrap()
+        );
+    }
+
+    /// Reading forward: an index written before the cutover loads unchanged.
+    #[test]
+    fn a_new_binary_reads_a_v1_container() {
+        let dim = 16;
+        let idx = container_fixture(200, dim);
+        let expected = vectors_by_id(&idx);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.kvec");
+        std::fs::write(&path, encode_v1(&idx)).unwrap();
+
+        let loaded = VectorIndex::<u64>::load_from_disk(&path).unwrap();
+        assert_vectors_bit_identical(&expected, &vectors_by_id(&loaded));
+        assert_eq!(
+            loaded.load_stats().unwrap().format_version,
+            HNSW_FORMAT_VERSION as u32,
+            "a legacy file must be reported as legacy, not silently as v2"
+        );
+        assert_eq!(
+            loaded.descriptor().model_id.as_deref(),
+            Some("test-model@1"),
+            "identity survives the legacy read path"
+        );
+    }
+
+    /// Reading backward: a binary that predates v2 must fail loudly rather than
+    /// misread. The old reader was exactly `rmp_serde::from_slice` into
+    /// `HnswSnapshot` followed by a version check, which is what `decode_v1`
+    /// still is, so running it against v2 bytes reproduces that binary's read.
+    ///
+    /// The positive control is what makes this test able to fail: the same
+    /// decoder must succeed on a genuine v1 container. Without it, a decoder
+    /// that rejected everything would pass.
+    #[test]
+    fn an_older_binary_cannot_misread_a_v2_container() {
+        let dim = 12;
+        let idx = container_fixture(120, dim);
+
+        let v1_bytes = encode_v1(&idx);
+        let v2_bytes = encode_v2(
+            &idx.with_canonical_graph(|graph| Ok(graph.clone_for_persist()))
+                .unwrap(),
+        )
+        .unwrap();
+
+        // Positive control: the legacy decoder reads a legacy container.
+        decode_v1::<u64>(&v1_bytes).expect("the v1 decoder must accept a v1 container");
+
+        // The claim: it cannot read a v2 container, by any outcome other than an
+        // error. Never a graph, never a partial graph, never a default.
+        let outcome = decode_v1::<u64>(&v2_bytes);
+        assert!(
+            outcome.is_err(),
+            "a v1 decoder must refuse a v2 container instead of misreading it"
+        );
+
+        // And the same at the raw serde layer the old binary actually called, so
+        // the proof does not depend on `decode_v1` keeping its current shape.
+        let raw: Result<HnswSnapshot<u64>, _> = rmp_serde::from_slice(&v2_bytes);
+        assert!(
+            raw.is_err(),
+            "MessagePack must not decode a v2 container into a snapshot"
+        );
+
+        // The mechanism, pinned: a v1 container opens with the MessagePack
+        // two-element array marker and a v2 container cannot collide with it.
+        assert_eq!(v1_bytes[0], 0x92, "v1 opens as a two-element msgpack array");
+        assert_ne!(v2_bytes[0], 0x92, "v2 must not open as a msgpack array");
+    }
+
+    #[test]
+    fn a_v1_container_migrates_to_v2_on_the_next_save() {
+        let dim = 16;
+        let idx = container_fixture(150, dim);
+        let expected = vectors_by_id(&idx);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.kvec");
+        std::fs::write(&path, encode_v1(&idx)).unwrap();
+        assert!(!is_v2_container(&std::fs::read(&path).unwrap()));
+
+        let loaded = VectorIndex::<u64>::load_from_disk(&path).unwrap();
+        loaded.save(&path).unwrap();
+
+        assert!(
+            is_v2_container(&std::fs::read(&path).unwrap()),
+            "a full write after a legacy read must land the new container"
+        );
+        let migrated = VectorIndex::<u64>::load_from_disk(&path).unwrap();
+        assert_vectors_bit_identical(&expected, &vectors_by_id(&migrated));
+        assert_eq!(
+            migrated.descriptor().graph_root.as_deref(),
+            Some("root-abcdef"),
+            "migration must not disturb the stamped identity"
+        );
+    }
+
+    /// The counters the format change is accepted on. These are counts taken
+    /// from the loads themselves, so they do not move with machine load.
+    #[test]
+    fn v2_pays_no_per_element_decode_and_no_heap_read() {
+        // Wide enough that the vector payload dominates the file, which is the
+        // regime the format change is aimed at and the regime real stores are in
+        // (768 dimensions per stored entity).
+        let dim = 256;
+        let n = 200u64;
+        let idx = container_fixture(n, dim);
+        let live = idx.len() as u64;
+
+        let dir = tempfile::tempdir().unwrap();
+        let v1_path = dir.path().join("legacy.kvec");
+        let v2_path = dir.path().join("current.kvec");
+        std::fs::write(&v1_path, encode_v1(&idx)).unwrap();
+        idx.save(&v2_path).unwrap();
+
+        let v1 = VectorIndex::<u64>::load_from_disk(&v1_path)
+            .unwrap()
+            .load_stats()
+            .unwrap();
+        let v2 = VectorIndex::<u64>::load_from_disk(&v2_path)
+            .unwrap()
+            .load_stats()
+            .unwrap();
+
+        // Every stored dimension cost the v1 load one tagged element decode.
+        assert_eq!(v1.msgpack_float_decodes, live * dim as u64);
+        assert_eq!(v2.msgpack_float_decodes, 0, "v2 decodes no float elements");
+
+        // v1 hands the whole file to the MessagePack decoder; v2 hands it only
+        // the header, and the payload never reaches the decoder at all.
+        assert_eq!(v1.bytes_decoded, v1.file_bytes);
+        assert!(
+            v2.bytes_decoded < v2.file_bytes / 2,
+            "v2 header {} should be a small part of the file {}",
+            v2.bytes_decoded,
+            v2.file_bytes
+        );
+        assert_eq!(v2.vector_payload_bytes, live * dim as u64 * 4);
+        assert_eq!(v2.vector_slots, live);
+
+        // The bytes are mapped, not copied to the heap, on both paths.
+        assert_eq!(v2.bytes_read_into_heap, 0);
+        assert_eq!(v2.bytes_mapped, v2.file_bytes);
+
+        // The tag tax, measured rather than asserted: v1 spends five bytes per
+        // stored dimension where v2 spends four, so the file should shrink by
+        // one byte per stored dimension. The tolerance covers the container's
+        // own framing — the preamble, its padding, and the per-node payload slot
+        // the v2 header carries — none of which scale with dimensionality.
+        let tag_bytes = live * dim as u64;
+        assert!(
+            v1.file_bytes > v2.file_bytes,
+            "v1 {} should exceed v2 {}",
+            v1.file_bytes,
+            v2.file_bytes
+        );
+        let saved = v1.file_bytes - v2.file_bytes;
+        assert!(
+            saved * 10 >= tag_bytes * 9 && saved * 10 <= tag_bytes * 11,
+            "saving {saved} should track the {tag_bytes} type-tag bytes \
+             (v1 {} bytes, v2 {} bytes)",
+            v1.file_bytes,
+            v2.file_bytes
+        );
+    }
+
+    #[test]
+    fn removed_slots_carry_no_payload_bytes() {
+        let dim = 8;
+        let n = 64u64;
+        let idx = VectorIndex::<u64>::new(dim).unwrap();
+        idx.upsert_batch((0..n).map(|k| (k, batch_test_vec(k, dim))).collect())
+            .unwrap();
+        for k in 0..n / 2 {
+            idx.remove(&k).unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("churned.kvec");
+        idx.save(&path).unwrap();
+
+        let stats = VectorIndex::<u64>::load_from_disk(&path)
+            .unwrap()
+            .load_stats()
+            .unwrap();
+        assert_eq!(
+            stats.vector_slots,
+            idx.len() as u64,
+            "the payload holds live vectors only, not the free list"
+        );
+        assert_eq!(
+            stats.vector_payload_bytes,
+            idx.len() as u64 * dim as u64 * 4
+        );
+    }
+
+    /// A stamped identity must survive the new container, and a mismatched one
+    /// must still be refused. The container version is not part of identity, so
+    /// changing the encoding cannot by itself invalidate an index.
+    #[test]
+    fn the_v2_container_neither_loses_nor_widens_identity() {
+        let dim = 8;
+        let idx = container_fixture(64, dim);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stamped.kvec");
+        idx.save(&path).unwrap();
+
+        let matching = IndexDescriptor {
+            model_id: Some("test-model@1".to_string()),
+            graph_root: Some("root-abcdef".to_string()),
+        };
+        VectorIndex::<u64>::load_checked(&path, dim, &matching)
+            .expect("the stamped identity must round-trip through v2");
+
+        for wrong in [
+            IndexDescriptor {
+                model_id: Some("other-model@1".to_string()),
+                graph_root: Some("root-abcdef".to_string()),
+            },
+            IndexDescriptor {
+                model_id: Some("test-model@1".to_string()),
+                graph_root: Some("root-999999".to_string()),
+            },
+        ] {
+            assert!(
+                matches!(
+                    VectorIndex::<u64>::load_checked(&path, dim, &wrong),
+                    Err(VectorError::ModelMismatch { .. })
+                ),
+                "a mismatched identity must still be refused under v2"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_v2_containers_are_refused() {
+        let dim = 8;
+        let idx = container_fixture(32, dim);
+        let good = encode_v2(
+            &idx.with_canonical_graph(|graph| Ok(graph.clone_for_persist()))
+                .unwrap(),
+        )
+        .unwrap();
+        // Positive control: the decoder accepts the container it is given.
+        decode_v2::<u64>(&good).expect("a well-formed container must decode");
+
+        let mut short_preamble = good.clone();
+        short_preamble.truncate(KVEC_V2_PREAMBLE_LEN - 1);
+        assert!(decode_v2::<u64>(&short_preamble).is_err());
+
+        let mut wrong_version = good.clone();
+        wrong_version[4..8].copy_from_slice(&99u32.to_le_bytes());
+        assert!(decode_v2::<u64>(&wrong_version).is_err());
+
+        let mut truncated_payload = good.clone();
+        truncated_payload.truncate(good.len() - 4);
+        assert!(
+            decode_v2::<u64>(&truncated_payload).is_err(),
+            "a payload cut short must be refused, not read past its end"
+        );
+
+        let mut dimension_disagreement = good.clone();
+        dimension_disagreement[32..40].copy_from_slice(&(dim as u64 + 1).to_le_bytes());
+        assert!(
+            decode_v2::<u64>(&dimension_disagreement).is_err(),
+            "the preamble and header must be cross-checked"
+        );
+
+        let mut header_overruns = good.clone();
+        header_overruns[8..16].copy_from_slice(&(good.len() as u64 + 1).to_le_bytes());
+        assert!(decode_v2::<u64>(&header_overruns).is_err());
     }
 }
