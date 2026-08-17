@@ -5448,10 +5448,7 @@ mod tests {
         let idx = container_fixture(120, dim);
 
         let v1_bytes = encode_v1(&idx);
-        let v2_bytes = encode_v2(
-            &idx.canonical_persist_snapshot().unwrap().0,
-        )
-        .unwrap();
+        let v2_bytes = encode_v2(&idx.canonical_persist_snapshot().unwrap().0).unwrap();
 
         // Positive control: the legacy decoder reads a legacy container.
         decode_v1::<u64>(&v1_bytes).expect("the v1 decoder must accept a v1 container");
@@ -5646,10 +5643,7 @@ mod tests {
     fn malformed_v2_containers_are_refused() {
         let dim = 8;
         let idx = container_fixture(32, dim);
-        let good = encode_v2(
-            &idx.canonical_persist_snapshot().unwrap().0,
-        )
-        .unwrap();
+        let good = encode_v2(&idx.canonical_persist_snapshot().unwrap().0).unwrap();
         // Positive control: the decoder accepts the container it is given.
         decode_v2::<u64>(&good).expect("a well-formed container must decode");
 
