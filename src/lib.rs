@@ -4976,6 +4976,252 @@ mod tests {
         );
     }
 
+    /// Citable-bar guarantee, across the two routes canonicalization can take:
+    /// an index that is built, saved, reloaded and rebuilt must serialize to the
+    /// SAME bytes whether the rebuild ran in place under the write lock or on the
+    /// off-lock copy `save` takes.
+    ///
+    /// This is the property the fix had to keep. A rebuild is a pure function of
+    /// the key set — level comes from [`hnsw_level_for_key`], a stable digest of
+    /// the key, and slot order comes from a digest-then-id-bytes sort — so moving
+    /// WHERE the rebuild runs must not move WHAT it produces. Both routes call
+    /// [`HnswGraph::rebuild_canonical`], and this holds them to it end to end,
+    /// through a real reload rather than only in memory.
+    #[test]
+    fn a_reloaded_index_rebuilds_to_byte_identical_bytes() {
+        let dim = 24;
+        let idx = container_fixture(400, dim);
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.kvec");
+        idx.save(&first).unwrap();
+        let reference = std::fs::read(&first).unwrap();
+
+        // Route 1: reload, rebuild IN PLACE under the write lock, save.
+        let in_place = VectorIndex::<u64>::load_from_disk(&first).unwrap();
+        in_place.compact().unwrap();
+        let in_place_path = dir.path().join("in_place.kvec");
+        in_place.save(&in_place_path).unwrap();
+        assert_eq!(
+            std::fs::read(&in_place_path).unwrap(),
+            reference,
+            "an in-place rebuild of a reloaded index did not reproduce the saved bytes"
+        );
+
+        // Route 2: reload, mark the order stale, and let `save` canonicalize its
+        // off-lock copy — the path this change introduced.
+        let off_lock = VectorIndex::<u64>::load_from_disk(&first).unwrap();
+        off_lock.graph.write().mark_mutated();
+        let off_lock_path = dir.path().join("off_lock.kvec");
+        off_lock.save(&off_lock_path).unwrap();
+        assert_eq!(
+            std::fs::read(&off_lock_path).unwrap(),
+            reference,
+            "an off-lock rebuild did not reproduce the saved bytes"
+        );
+
+        // Having rebuilt off the lock with nothing racing it, `save` must have
+        // installed the result, so the next save of an untouched index takes the
+        // already-canonical path — and still writes the same bytes.
+        assert!(
+            !off_lock.graph.read().canonical_order_dirty,
+            "an uncontended save must leave the live graph canonical, or every \
+             later save re-canonicalizes from scratch"
+        );
+        let again_path = dir.path().join("again.kvec");
+        off_lock.save(&again_path).unwrap();
+        assert_eq!(
+            std::fs::read(&again_path).unwrap(),
+            reference,
+            "the already-canonical save path diverged from the rebuild path"
+        );
+    }
+
+    /// FIR-2367: `save` must not hold the graph lock across the HNSW rebuild.
+    ///
+    /// Before the fix, `save` upgraded the graph lock to a writer and rebuilt
+    /// every node in place before it could copy anything out, so a concurrent
+    /// upsert waited for the whole rebuild. That was the stall a commit minting
+    /// vectors paid. The fix copies the rebuild's inputs under a READ lock and
+    /// rebuilds off the lock, so the longest anyone waits is that copy.
+    ///
+    /// Asserted as a RATIO against the save's own duration rather than an absolute
+    /// bound, so it means the same thing on a fast machine and a loaded one: with
+    /// the lock held across the rebuild the worst stall is essentially the entire
+    /// save, and with it released the stall is the copy, a small fraction of it.
+    /// The two counters also make the test unable to pass vacuously — a reader or
+    /// writer that never ran would report no stall at all.
+    #[test]
+    fn a_save_does_not_hold_the_graph_lock_across_the_rebuild() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+        use std::sync::{Arc, Barrier};
+        use std::time::Instant;
+
+        let dim = 32;
+        let n: u64 = 2500;
+        let idx = Arc::new(VectorIndex::<u64>::new(dim).unwrap());
+        idx.upsert_batch((0..n).map(|k| (k, batch_test_vec(k, dim))).collect())
+            .unwrap();
+        assert!(
+            idx.graph.read().canonical_order_dirty,
+            "the save under test must be one that actually rebuilds"
+        );
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(Barrier::new(3));
+        let write_stall_ns = Arc::new(AtomicU64::new(0));
+        let read_stall_ns = Arc::new(AtomicU64::new(0));
+
+        let writer = {
+            let (idx, stop, ready, stall) = (
+                Arc::clone(&idx),
+                Arc::clone(&stop),
+                Arc::clone(&ready),
+                Arc::clone(&write_stall_ns),
+            );
+            std::thread::spawn(move || {
+                ready.wait();
+                let mut key = n;
+                let mut ops = 0u64;
+                while !stop.load(AtomicOrdering::Relaxed) {
+                    let vector = batch_test_vec(key, dim);
+                    let started = Instant::now();
+                    idx.upsert(key, &vector).unwrap();
+                    stall.fetch_max(started.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+                    key += 1;
+                    ops += 1;
+                }
+                ops
+            })
+        };
+
+        let reader = {
+            let (idx, stop, ready, stall) = (
+                Arc::clone(&idx),
+                Arc::clone(&stop),
+                Arc::clone(&ready),
+                Arc::clone(&read_stall_ns),
+            );
+            std::thread::spawn(move || {
+                ready.wait();
+                let probe = batch_test_vec(11, dim);
+                let mut ops = 0u64;
+                while !stop.load(AtomicOrdering::Relaxed) {
+                    let started = Instant::now();
+                    idx.search_similar(&probe, 10).unwrap();
+                    stall.fetch_max(started.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+                    ops += 1;
+                }
+                ops
+            })
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        ready.wait();
+        let started = Instant::now();
+        idx.save(&dir.path().join("idx.kvec")).unwrap();
+        let save_ns = started.elapsed().as_nanos() as u64;
+        stop.store(true, AtomicOrdering::Relaxed);
+
+        let writes = writer.join().unwrap();
+        let reads = reader.join().unwrap();
+        assert!(
+            writes > 0 && reads > 0,
+            "no concurrent work ran, so the stalls below measure nothing: \
+             {writes} upserts, {reads} searches"
+        );
+
+        let worst_write = write_stall_ns.load(AtomicOrdering::Relaxed);
+        let worst_read = read_stall_ns.load(AtomicOrdering::Relaxed);
+        assert!(
+            worst_write * 2 < save_ns,
+            "an upsert stalled {worst_write} ns during a {save_ns} ns save, which \
+             is the graph lock being held across the rebuild"
+        );
+        assert!(
+            worst_read * 2 < save_ns,
+            "a search stalled {worst_read} ns during a {save_ns} ns save, which is \
+             the graph lock being held across the rebuild"
+        );
+    }
+
+    /// The hazard the off-lock rebuild creates, and the guard that closes it.
+    ///
+    /// `save` canonicalizes a copy taken before the upserts that land while it
+    /// runs, then installs that copy back so the next save stays cheap. Installed
+    /// unconditionally, it would silently revert every one of those upserts —
+    /// vectors accepted, acknowledged, and then gone. The mutation counter is what
+    /// makes the install decline instead.
+    ///
+    /// Writes NEW keys throughout the save, then asserts every one is still
+    /// retrievable. The counters keep it from passing vacuously: a run where the
+    /// writer finished before the rebuild began would prove nothing, so the test
+    /// requires writes to have landed on both sides of the snapshot.
+    #[test]
+    fn upserts_landing_during_a_save_are_not_reverted_by_the_install() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+        use std::sync::{Arc, Barrier};
+
+        let dim = 32;
+        let n: u64 = 2000;
+        let idx = Arc::new(VectorIndex::<u64>::new(dim).unwrap());
+        idx.upsert_batch((0..n).map(|k| (k, batch_test_vec(k, dim))).collect())
+            .unwrap();
+        assert!(
+            idx.graph.read().canonical_order_dirty,
+            "the save under test must be one that actually rebuilds"
+        );
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(Barrier::new(2));
+        let written = Arc::new(AtomicU64::new(0));
+
+        let writer = {
+            let (idx, stop, ready, written) = (
+                Arc::clone(&idx),
+                Arc::clone(&stop),
+                Arc::clone(&ready),
+                Arc::clone(&written),
+            );
+            std::thread::spawn(move || {
+                ready.wait();
+                let mut key = n;
+                while !stop.load(AtomicOrdering::Relaxed) {
+                    idx.upsert(key, &batch_test_vec(key, dim)).unwrap();
+                    written.store(key + 1, AtomicOrdering::Release);
+                    key += 1;
+                }
+                key
+            })
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        ready.wait();
+        idx.save(&dir.path().join("idx.kvec")).unwrap();
+        stop.store(true, AtomicOrdering::Relaxed);
+        let last_key = writer.join().unwrap();
+
+        let added = last_key - n;
+        assert!(
+            added > 1,
+            "only {added} concurrent upserts landed, too few for the install to \
+             have had anything to revert"
+        );
+
+        for key in n..last_key {
+            assert!(
+                idx.get(&key).is_some(),
+                "key {key}, upserted during the save, was lost when the off-lock \
+                 rebuild was installed"
+            );
+        }
+        assert_eq!(
+            idx.len(),
+            (last_key) as usize,
+            "the index lost or gained entries across a save that raced upserts"
+        );
+    }
+
     /// Recall metric: for each query, compute the true k-NN by brute force over
     /// `candidates`, then measure what fraction the ANN result captures.
     fn recall_at_k(
