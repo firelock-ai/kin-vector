@@ -1333,7 +1333,8 @@ impl<Id: VectorId> HnswGraph<Id> {
         // between would consult inbound lists that were never populated and
         // leave dangling edges behind. Either the whole table is present or it
         // is visibly absent; there is no in-between state a mutation can see.
-        self.ensure_backlinks_ready();
+        // FALSIFICATION PROBE (test/vectorcut-falsify-kv2): call dropped on purpose.
+        // self.ensure_backlinks_ready();
         let node_sq_norm = squared_norm(vector);
         let node = HnswNode {
             vector: NodeVector::owned(vector.to_vec()),
@@ -2559,6 +2560,12 @@ fn encode_v2<Id: VectorId>(graph: &HnswGraph<Id>) -> Result<Vec<u8>, VectorError
 }
 
 /// Deserialize a version 2 container.
+// FALSIFICATION PROBE (test/vectorcut-falsify-kv2): decode_container's version 2
+// arm below is deleted on purpose, which leaves this function with no caller
+// outside `#[cfg(test)]`. Silenced here rather than left to fail the build on an
+// unrelated dead-code error that would mask the guard failures this probe exists
+// to see.
+#[allow(dead_code)]
 fn decode_v2<Id: VectorId>(bytes: &[u8]) -> Result<(HnswGraph<Id>, KvecLoadStats), VectorError> {
     let malformed =
         |what: &str| VectorError::IndexError(format!("malformed kvec container: {what}"));
@@ -3028,10 +3035,9 @@ fn decode_container<Id: VectorId>(
             let (graph, stats) = decode_v1(container.bytes())?;
             Ok((graph, container.with_byte_source(stats)))
         }
-        Some(KVEC_V2_VERSION) => {
-            let (graph, stats) = decode_v2(container.bytes())?;
-            Ok((graph, container.with_byte_source(stats)))
-        }
+        // FALSIFICATION PROBE (test/vectorcut-falsify-kv2): the version 2 arm is
+        // deleted on purpose, so this decoder accepts only version 3 and version 2
+        // falls into the "unsupported" arm below.
         Some(KVEC_V3_VERSION) => decode_v3(container),
         Some(version) => Err(VectorError::IndexError(format!(
             "unsupported kvec container version {version}; this reader accepts {min} \
