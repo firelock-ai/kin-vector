@@ -893,6 +893,45 @@ impl<Id: VectorId> HnswGraph<Id> {
         }
     }
 
+    /// How many layers the node at `idx` participates in.
+    ///
+    /// Zero for a node that does not exist or was removed, so a caller does not
+    /// have to check both.
+    #[inline]
+    fn node_layer_count(&self, idx: usize) -> usize {
+        match self.nodes.get(idx) {
+            Some(node) => node.connections.len(),
+            None => 0,
+        }
+    }
+
+    /// Every layer's outgoing neighbours for one node, owned.
+    ///
+    /// For the callers that mutate while holding the lists, and for the
+    /// encoders, which write them into a header. Costs a copy per node, which
+    /// is why nothing on the traversal path calls it.
+    fn connections_to_owned(&self, idx: usize) -> Vec<Vec<usize>> {
+        (0..self.node_layer_count(idx))
+            .map(|layer| self.neighbors_at(idx, layer).to_vec())
+            .collect()
+    }
+
+    /// The node's outgoing neighbours at one layer.
+    ///
+    /// Empty for a node or layer that does not exist, which is what lets the
+    /// traversal drop the separate bounds check it used to do at every visit.
+    #[inline]
+    fn neighbors_at(&self, idx: usize, layer: usize) -> NeighborSlice<'_> {
+        match self
+            .nodes
+            .get(idx)
+            .and_then(|node| node.connections.get(layer))
+        {
+            Some(values) => NeighborSlice::Heap(values.as_slice()),
+            None => NeighborSlice::Empty,
+        }
+    }
+
     /// True when the node at `idx` carries a vector a traversal may score.
     #[inline]
     fn has_vector(&self, idx: usize) -> bool {
@@ -1091,7 +1130,7 @@ impl<Id: VectorId> HnswGraph<Id> {
         if !self.has_vector(entry) {
             return Vec::new();
         }
-        if layer >= self.nodes[entry].connections.len() {
+        if layer >= self.node_layer_count(entry) {
             return Vec::new();
         }
 
@@ -1121,14 +1160,12 @@ impl<Id: VectorId> HnswGraph<Id> {
                 break;
             }
 
-            let node = &self.nodes[c_idx];
-            let neighbors = if layer < node.connections.len() {
-                &node.connections[layer]
-            } else {
+            let neighbors = self.neighbors_at(c_idx, layer);
+            if neighbors.is_empty() {
                 continue;
-            };
+            }
 
-            for &nb in neighbors {
+            for nb in neighbors.iter() {
                 if !visited.insert(nb) {
                     continue;
                 }
@@ -1136,7 +1173,7 @@ impl<Id: VectorId> HnswGraph<Id> {
                 if !self.has_vector(nb) {
                     continue;
                 }
-                if layer >= self.nodes[nb].connections.len() {
+                if layer >= self.node_layer_count(nb) {
                     continue;
                 }
                 let nb_dist = self.distance_to_node(query, nb);
@@ -1192,21 +1229,23 @@ impl<Id: VectorId> HnswGraph<Id> {
             let mut changed = true;
             while changed {
                 changed = false;
-                let node = &self.nodes[current];
-                if level < node.connections.len() {
-                    for &nb in &node.connections[level] {
-                        if !self.has_vector(nb) {
-                            continue;
-                        }
-                        if level >= self.nodes[nb].connections.len() {
-                            continue;
-                        }
-                        let d_nb = self.distance_to_node(query, nb);
-                        if d_nb < d_cur {
-                            current = nb;
-                            d_cur = d_nb;
-                            changed = true;
-                        }
+                // Read from the node the descent is standing on, before any
+                // reassignment below, which is what the direct field read did:
+                // a move mid-scan finishes the old node's neighbours and the
+                // outer `while changed` picks the new one up.
+                let neighbors = self.neighbors_at(current, level);
+                for nb in neighbors.iter() {
+                    if !self.has_vector(nb) {
+                        continue;
+                    }
+                    if level >= self.node_layer_count(nb) {
+                        continue;
+                    }
+                    let d_nb = self.distance_to_node(query, nb);
+                    if d_nb < d_cur {
+                        current = nb;
+                        d_cur = d_nb;
+                        changed = true;
                     }
                 }
             }
@@ -1304,7 +1343,7 @@ impl<Id: VectorId> HnswGraph<Id> {
         self.backlinks.resize_with(self.nodes.len(), Vec::new);
 
         for source in 0..self.nodes.len() {
-            let connections = self.nodes[source].connections.clone();
+            let connections = self.connections_to_owned(source);
             for (layer, neighbors) in connections.into_iter().enumerate() {
                 for target in Self::dedupe_neighbors(neighbors) {
                     self.add_backlink(target, layer, source);
@@ -1503,7 +1542,7 @@ impl<Id: VectorId> HnswGraph<Id> {
             let m_max = if lc == 0 { M_MAX_0 } else { M };
             per_layer[lc] = Self::select_neighbors(&neighbors_found, m_max)
                 .into_iter()
-                .filter(|&nb| lc < self.nodes[nb].connections.len())
+                .filter(|&nb| lc < self.node_layer_count(nb))
                 .collect();
 
             // Use the closest found neighbor as the entry for the next layer.
@@ -1582,17 +1621,17 @@ impl<Id: VectorId> HnswGraph<Id> {
 
             // Add bidirectional connections.
             for &nb in selected {
-                if lc >= self.nodes[nb].connections.len() {
+                if lc >= self.node_layer_count(nb) {
                     continue;
                 }
                 self.add_directed_connection(nb, idx, lc);
                 let nb_m_max = if lc == 0 { M_MAX_0 } else { M };
-                if self.nodes[nb].connections[lc].len() > nb_m_max {
+                if self.neighbors_at(nb, lc).len() > nb_m_max {
                     // Prune: keep only the closest nb_m_max neighbors.
                     // Clone data to satisfy the borrow checker.
                     let nb_vec = self.vector_to_owned(nb);
                     let nb_query = PreparedQuery::new(self, &nb_vec);
-                    let conns = self.nodes[nb].connections[lc].clone();
+                    let conns = self.neighbors_at(nb, lc).to_vec();
                     let mut scored: Vec<(f32, usize)> = conns
                         .iter()
                         .map(|&n| (self.distance_to_node(&nb_query, n), n))
@@ -1707,7 +1746,7 @@ impl<Id: VectorId> HnswGraph<Id> {
 
         // Drop outbound edges from this node by removing its source backlink from
         // each target. The node's own connection lists are cleared below.
-        let outgoing = self.nodes[idx].connections.clone();
+        let outgoing = self.connections_to_owned(idx);
         for (layer, neighbors) in outgoing.into_iter().enumerate() {
             for nb in neighbors {
                 self.remove_backlink(nb, layer, idx);
@@ -1723,7 +1762,7 @@ impl<Id: VectorId> HnswGraph<Id> {
         };
         for (layer, sources) in incoming.into_iter().enumerate() {
             for source in sources {
-                if source < self.nodes.len() && layer < self.nodes[source].connections.len() {
+                if source < self.nodes.len() && layer < self.node_layer_count(source) {
                     self.nodes[source].connections[layer].retain(|&n| n != idx);
                 }
             }
@@ -2412,6 +2451,50 @@ pub fn hamming_distance(a: &[u8], b: &[u8]) -> Option<u32> {
     )
 }
 
+/// A node's outgoing neighbours at one layer, however they are stored.
+///
+/// The seam the mapped neighbour arena needs, introduced with only the heap arm
+/// so it can be proven a no-op. Every read of `connections` on the traversal and
+/// encode paths goes through [`HnswGraph::neighbors_at`], which returns this, so
+/// adding a `Mapped(&[u32])` arm later is one variant and one container section
+/// rather than a rewrite of twenty-two call sites.
+///
+/// Three operations, which is all the call sites use: a length, an iteration
+/// yielding node indices, and an owned copy for the two places that need to
+/// mutate while holding one.
+enum NeighborSlice<'a> {
+    Heap(&'a [usize]),
+    Empty,
+}
+
+impl NeighborSlice<'_> {
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            NeighborSlice::Heap(values) => values.len(),
+            NeighborSlice::Empty => 0,
+        }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        let values: &[usize] = match self {
+            NeighborSlice::Heap(values) => values,
+            NeighborSlice::Empty => &[],
+        };
+        values.iter().copied()
+    }
+
+    fn to_vec(&self) -> Vec<usize> {
+        self.iter().collect()
+    }
+}
+
 /// How a node's vector is stored, as the distance kernel sees it.
 ///
 /// The traversal prefers `Q8` when the container carries it, because the codes
@@ -2575,7 +2658,7 @@ fn encode_v3_with<Id: VectorId>(
             Some(slot)
         };
         nodes.push(KvecNodeV2 {
-            connections: node.connections.clone(),
+            connections: graph.connections_to_owned(idx),
             level: node.level,
             payload_slot,
         });
@@ -3194,7 +3277,7 @@ fn encode_v2<Id: VectorId>(graph: &HnswGraph<Id>) -> Result<Vec<u8>, VectorError
             Some(slot)
         };
         nodes.push(KvecNodeV2 {
-            connections: node.connections.clone(),
+            connections: graph.connections_to_owned(idx),
             level: node.level,
             payload_slot,
         });
@@ -7274,6 +7357,78 @@ mod tests {
             v3.bytes_decoded,
             v3.file_bytes
         );
+    }
+
+    /// The seam is a no-op: the accessors agree with the field they replaced,
+    /// for every node and every layer, on a real fixture.
+    ///
+    /// This is the whole claim of the accessor change, and it is asserted
+    /// against the DIRECT field read rather than against another accessor, so a
+    /// seam that was wrong in the same way twice cannot pass. It also asserts
+    /// the out-of-range answers, since the traversal now relies on an empty
+    /// slice where it used to do its own bounds check, and it asserts the
+    /// fixture is non-trivial in both dimensions: more than one layer somewhere,
+    /// and a node with neighbours.
+    #[test]
+    fn the_neighbour_accessors_agree_with_the_field_they_replaced() {
+        let dim = 24;
+        let idx = container_fixture(300, dim);
+        idx.ensure_canonical_order().unwrap();
+        let graph = idx.graph.read();
+
+        let mut layers_seen = 0usize;
+        let mut edges_seen = 0usize;
+        let mut multi_layer_nodes = 0usize;
+        for (node_index, node) in graph.nodes.iter().enumerate() {
+            assert_eq!(
+                graph.node_layer_count(node_index),
+                node.connections.len(),
+                "layer count for node {node_index}"
+            );
+            if node.connections.len() > 1 {
+                multi_layer_nodes += 1;
+            }
+            for (layer, expected) in node.connections.iter().enumerate() {
+                let got = graph.neighbors_at(node_index, layer);
+                assert_eq!(
+                    got.len(),
+                    expected.len(),
+                    "node {node_index} layer {layer} degree"
+                );
+                assert_eq!(
+                    got.to_vec(),
+                    *expected,
+                    "node {node_index} layer {layer} neighbours"
+                );
+                assert_eq!(got.is_empty(), expected.is_empty());
+                layers_seen += 1;
+                edges_seen += expected.len();
+            }
+
+            // One past the last layer, which the traversal now relies on.
+            let past = graph.neighbors_at(node_index, node.connections.len());
+            assert!(past.is_empty(), "node {node_index} past its last layer");
+        }
+
+        // A node index past the end, same rule.
+        assert_eq!(graph.node_layer_count(graph.nodes.len()), 0);
+        assert!(graph.neighbors_at(graph.nodes.len(), 0).is_empty());
+
+        assert!(layers_seen > 300, "only {layers_seen} layers walked");
+        assert!(edges_seen > 3_000, "only {edges_seen} edges walked");
+        assert!(
+            multi_layer_nodes > 0,
+            "every node had one layer, so the upper-layer arms were never exercised"
+        );
+
+        // And the owned form, which the encoders and the mutation paths use.
+        for (node_index, node) in graph.nodes.iter().enumerate() {
+            assert_eq!(
+                graph.connections_to_owned(node_index),
+                node.connections,
+                "owned connections for node {node_index}"
+            );
+        }
     }
 
     // ── the quantized payload ────────────────────────────────────────────────
