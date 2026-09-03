@@ -2353,6 +2353,29 @@ struct BinaryPayload {
     stride: usize,
 }
 
+/// The number of differing bits between two packed sign codes.
+///
+/// The prefilter kernel. For two vectors whose angle is theta, the expected
+/// fraction of differing sign bits is `theta / pi`, so a Hamming distance of
+/// `h` over `d` dimensions estimates the cosine as `cos(pi * h / d)`. That
+/// estimate is coarse, which is the point: it costs `ceil(d / 64)` population
+/// counts against `d` multiply-accumulates, so it is worth running on a wide
+/// candidate set before the codes are scored.
+///
+/// Returns `None` when the codes are different lengths, since a Hamming
+/// distance between two different spaces is not a number that means anything.
+pub fn hamming_distance(a: &[u8], b: &[u8]) -> Option<u32> {
+    if a.len() != b.len() {
+        return None;
+    }
+    Some(
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x ^ y).count_ones())
+            .sum(),
+    )
+}
+
 /// How a node's vector is stored, as the distance kernel sees it.
 ///
 /// The traversal prefers `Q8` when the container carries it, because the codes
@@ -2415,7 +2438,7 @@ impl MappedPayload {
 
     /// The packed sign bits of one slot, read in place.
     #[inline]
-    fn binary_slot(&self, slot: usize) -> Option<&[u8]> {
+    pub fn binary_slot(&self, slot: usize) -> Option<&[u8]> {
         let binary = self.binary.as_ref()?;
         if slot >= self.slot_count {
             return None;
@@ -2473,6 +2496,12 @@ impl MappedPayload {
 /// The floats written are bit-identical to what `encode_v2` writes, in the same
 /// slot order, so a v2 file and a v3 file built from the same graph hold the
 /// same payload bytes at their respective payload offsets.
+/// Encode with every column at its default, which is the f32 payload alone.
+///
+/// Test-only: the library writes through `encode_v3_with`, since `save` carries
+/// the caller's options. It exists so the four call sites that want the default
+/// do not each spell it out.
+#[cfg(test)]
 fn encode_v3<Id: VectorId>(graph: &HnswGraph<Id>) -> Result<Vec<u8>, VectorError> {
     encode_v3_with(graph, KvecQuantizeOptions::default())
 }
@@ -2553,11 +2582,11 @@ fn encode_v3_with<Id: VectorId>(
     let describe = |first_offset: u64| -> Vec<SectionDesc> {
         let mut sections: Vec<SectionDesc> = Vec::with_capacity(5);
         let mut cursor = first_offset;
-        let mut push = |sections: &mut Vec<SectionDesc>,
-                        cursor: &mut u64,
-                        kind: SectionKind,
-                        stride: usize,
-                        count: usize| {
+        let push = |sections: &mut Vec<SectionDesc>,
+                    cursor: &mut u64,
+                    kind: SectionKind,
+                    stride: usize,
+                    count: usize| {
             sections.push(SectionDesc {
                 kind,
                 offset: *cursor,
@@ -3926,6 +3955,31 @@ impl<Id: VectorId> VectorIndex<Id> {
     /// Whether the index already contains an embedding for the given entity.
     pub fn contains(&self, entity_id: &Id) -> bool {
         self.graph.read().id_to_idx.contains_key(entity_id)
+    }
+
+    /// The packed sign bits of an entity's vector, when the container carries
+    /// the prefilter column.
+    ///
+    /// The traversal does NOT consume this column. Hamming distance over sign
+    /// bits approximates angular distance at roughly a twentieth of the
+    /// arithmetic of a full dot product, which makes it a real prefilter, but
+    /// putting it inside the layer-0 scan changes which candidates the
+    /// traversal reaches and therefore changes recall, so it needs a bound of
+    /// its own measured the way the int8 bound was. Until then the column is
+    /// written when asked for and readable by a caller that wants to prefilter
+    /// its own candidate set, and it is 96 bytes per vector at 768 dimensions.
+    pub fn binary_code(&self, entity_id: &Id) -> Option<Vec<u8>> {
+        let graph = self.graph.read();
+        let idx = *graph.id_to_idx.get(entity_id)?;
+        let slot = match graph.nodes.get(idx).map(|node| &node.vector) {
+            Some(NodeVector::Mapped(slot)) => *slot as usize,
+            _ => return None,
+        };
+        graph
+            .payload
+            .as_ref()?
+            .binary_slot(slot)
+            .map(|bits| bits.to_vec())
     }
 
     /// All keys currently held in the index.
@@ -5956,7 +6010,7 @@ mod tests {
         let query = vector_for(3);
         assert_eq!(
             hand_built
-                .distance_to_node(&query, squared_norm(&query), 0)
+                .distance_to_node(&PreparedQuery::new(&hand_built, &query), 0)
                 .to_bits(),
             cosine_distance(&query, hand_built.vector_at(0)).to_bits(),
             "absent memo must fall back to the fused kernel"
@@ -7484,6 +7538,63 @@ mod tests {
         assert!(
             negatives > 0,
             "no component was negative, so every bit was zero and this proved nothing"
+        );
+    }
+
+    /// The prefilter kernel and the accessor that reaches the column.
+    ///
+    /// Hamming distance over sign bits estimates the angle, so a vector against
+    /// itself must be zero and a vector against its own negation must be every
+    /// bit. Both ends are asserted, because a kernel returning a constant would
+    /// satisfy either one alone.
+    #[test]
+    fn the_prefilter_kernel_measures_the_angle_between_sign_codes() {
+        assert_eq!(hamming_distance(&[0x00, 0xff], &[0x00, 0xff]), Some(0));
+        assert_eq!(hamming_distance(&[0x00, 0xff], &[0xff, 0x00]), Some(16));
+        assert_eq!(hamming_distance(&[0x00], &[0x00, 0x00]), None);
+
+        let dim = 32;
+        let idx = container_fixture(80, dim);
+        idx.ensure_canonical_order().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefilter.kvec");
+        idx.save_with_options(&path, KvecQuantizeOptions::int8_only_with_prefilter())
+            .unwrap();
+        let loaded = VectorIndex::<u64>::load_from_disk(&path).unwrap();
+
+        let keys = loaded.keys();
+        let own = loaded
+            .binary_code(&keys[0])
+            .expect("a container with the column must answer");
+        assert_eq!(own.len(), binary_stride(dim));
+        assert_eq!(
+            hamming_distance(&own, &own),
+            Some(0),
+            "a code against itself"
+        );
+
+        // A different key must differ somewhere, or the column carries no
+        // information and the assertion above is about a constant.
+        let mut differed = false;
+        for key in keys.iter().skip(1) {
+            let other = loaded.binary_code(key).expect("every mapped key answers");
+            if hamming_distance(&own, &other) != Some(0) {
+                differed = true;
+                break;
+            }
+        }
+        assert!(
+            differed,
+            "every sign code was identical, so the column carries nothing"
+        );
+
+        // And a container without the column answers None rather than zeros.
+        let plain = dir.path().join("plain.kvec");
+        idx.save(&plain).unwrap();
+        let no_column = VectorIndex::<u64>::load_from_disk(&plain).unwrap();
+        assert!(
+            no_column.binary_code(&keys[0]).is_none(),
+            "a container with no prefilter column must answer None"
         );
     }
 
