@@ -6804,21 +6804,54 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("churned.kvec");
-        idx.save(&path).unwrap();
+        let v2_path = dir.path().join("churned-v2.kvec");
+        let v3_path = dir.path().join("churned.kvec");
+        std::fs::write(
+            &v2_path,
+            encode_v2(&idx.canonical_persist_snapshot().unwrap().0).unwrap(),
+        )
+        .unwrap();
+        idx.save(&v3_path).unwrap();
 
-        let stats = VectorIndex::<u64>::load_from_disk(&path)
+        let live = idx.len() as u64;
+        for path in [&v2_path, &v3_path] {
+            let stats = VectorIndex::<u64>::load_from_disk(path)
+                .unwrap()
+                .load_stats()
+                .unwrap();
+            assert_eq!(
+                stats.vector_slots,
+                live,
+                "the payload holds live vectors only, not the free list ({})",
+                path.display()
+            );
+        }
+
+        // The byte-level form of the same claim, on the format that copies. v3
+        // copies nothing at all, so its payload bytes are zero however many
+        // slots the free list holds, and `vector_slots` above is what carries
+        // the claim there.
+        let v2 = VectorIndex::<u64>::load_from_disk(&v2_path)
             .unwrap()
             .load_stats()
             .unwrap();
-        assert_eq!(
-            stats.vector_slots,
-            idx.len() as u64,
-            "the payload holds live vectors only, not the free list"
-        );
-        assert_eq!(
-            stats.vector_payload_bytes,
-            idx.len() as u64 * dim as u64 * 4
+        assert_eq!(v2.vector_payload_bytes, live * dim as u64 * 4);
+        let v3 = VectorIndex::<u64>::load_from_disk(&v3_path)
+            .unwrap()
+            .load_stats()
+            .unwrap();
+        assert_eq!(v3.vector_payload_bytes, 0);
+
+        // And the file itself is sized by live slots, not allocated ones, which
+        // is the claim `vector_payload_bytes` used to stand in for: half the
+        // slots were freed, so a container that kept them would be about eight
+        // dimensions times thirty-two vectors larger.
+        let dead_payload = (n - live) * dim as u64 * 4;
+        assert!(dead_payload > 0, "the fixture must actually free slots");
+        assert!(
+            v3.file_bytes < v2.file_bytes + dead_payload,
+            "v3 file {} must not carry the {dead_payload} bytes of freed slots",
+            v3.file_bytes
         );
     }
 
