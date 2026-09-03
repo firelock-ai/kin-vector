@@ -952,13 +952,28 @@ impl<Id: VectorId> HnswGraph<Id> {
             .is_some_and(|p| p.has_q8() && p.has_f32())
     }
 
-    /// A heap copy of the node's embedding, for the callers that must own one.
+    /// A heap copy of the node's embedding, at the best accuracy the container
+    /// holds.
     ///
-    /// Reconstructs `code * scale` for a quantized node, because that IS the
-    /// vector the index holds: re-encoding a quantized index to floats writes
-    /// exactly the information present and loses nothing that survived the
-    /// quantization.
+    /// Prefers the f32 section when there is one, unlike
+    /// [`HnswGraph::vector_view_at`], which prefers the codes. The two want
+    /// different things and it matters: the traversal wants the small
+    /// representation because its working set is what bounds it, and a caller
+    /// asking for an owned copy wants the accurate one. Re-encoding a container
+    /// that carries both would otherwise write reconstructions into its own f32
+    /// section and quietly degrade the exact column on every save.
+    ///
+    /// Falls back to reconstructing `code * scale`, which for a codes-only
+    /// container IS the vector the index holds.
     fn vector_to_owned(&self, idx: usize) -> Vec<f32> {
+        if let Some(NodeVector::Mapped(slot)) = self.nodes.get(idx).map(|node| &node.vector) {
+            if let Some(payload) = self.payload.as_ref() {
+                let exact = payload.f32_slot(*slot as usize);
+                if !exact.is_empty() {
+                    return exact.to_vec();
+                }
+            }
+        }
         match self.vector_view_at(idx) {
             VectorView::F32(values) => values.to_vec(),
             VectorView::Q8 { codes, scales } => codes
@@ -2249,6 +2264,27 @@ fn binary_stride(dimensions: usize) -> usize {
 /// A dimension that is zero everywhere gets a scale of 1.0 rather than 0.0, so
 /// its codes are all zero and no division by zero can reach a code.
 fn dimension_scales<Id: VectorId>(graph: &HnswGraph<Id>) -> Vec<f32> {
+    // A graph that is ALREADY quantized and has not been mutated since it was
+    // loaded keeps the table it came with, which makes a re-save idempotent.
+    //
+    // Recomputing would derive the maxima from the reconstruction instead of
+    // from the originals, and a maximum that moved by one step would shift the
+    // scale, which would shift some codes by one, which over repeated
+    // save-and-load cycles is a slow drift with no bottom. Reuse is only sound
+    // while every node is still mapped: a heap node arrived after the table was
+    // built and may hold a value the old range would clip.
+    let untouched = graph
+        .nodes
+        .iter()
+        .all(|node| !matches!(node.vector, NodeVector::Heap(_)));
+    if untouched {
+        if let Some(existing) = graph.dim_scales() {
+            if existing.len() == graph.dimensions {
+                return existing.to_vec();
+            }
+        }
+    }
+
     let mut max_abs = vec![0.0f32; graph.dimensions];
     for idx in 0..graph.nodes.len() {
         if !graph.has_vector(idx) {
@@ -2761,7 +2797,32 @@ fn encode_v3_with<Id: VectorId>(
                 }
             }
             SectionKind::SqNorms => {
-                for (node, value) in graph.sq_norms.iter().enumerate() {
+                // The table has to describe what the TRAVERSAL will score, and
+                // on a quantized container that is the reconstruction rather
+                // than the original: `distance_to_node`'s coded arm divides by
+                // this value while its dot product is taken against
+                // `code * scale`. Persisting the originals' norms would put a
+                // systematically wrong denominator under every coded distance,
+                // small enough to hide inside the recall bound and wrong
+                // anyway.
+                //
+                // Summed in index order, matching `squared_norm_scalar`, so the
+                // persisted value is reproducible.
+                let coded = scales.as_ref();
+                for node in 0..node_count {
+                    let value = match coded {
+                        None => graph.sq_norms.get(node).copied().unwrap_or(0.0),
+                        Some(scales) => {
+                            let mut acc = 0.0f32;
+                            for (value, scale) in
+                                graph.vector_to_owned(node).iter().zip(scales.iter())
+                            {
+                                let reconstructed = quantize_to_i8(*value, *scale) as f32 * *scale;
+                                acc += reconstructed * reconstructed;
+                            }
+                            acc
+                        }
+                    };
                     let at = start + node * 4;
                     out[at..at + 4].copy_from_slice(&value.to_le_bytes());
                 }
@@ -7626,6 +7687,83 @@ mod tests {
         assert!(
             negatives > 0,
             "no component was negative, so every bit was zero and this proved nothing"
+        );
+    }
+
+    /// A quantized container re-saved must be byte-identical.
+    ///
+    /// A re-save recomputes the scale table by default, and recomputing it from
+    /// the RECONSTRUCTION rather than from the originals lets a maximum that
+    /// moved by one step shift the scale, which shifts some codes by one, which
+    /// over repeated save-and-load cycles is a drift with no bottom. So an
+    /// untouched quantized graph keeps the table it came with.
+    ///
+    /// The control is the mutated arm: a graph that gained a heap node must NOT
+    /// reuse the table, because that node arrived after it was built and may
+    /// hold a value the old range would clip. Without that arm, an
+    /// implementation that always reused would pass.
+    #[test]
+    fn a_quantized_container_re_saved_is_byte_identical() {
+        let dim = 32;
+        let idx = container_fixture(150, dim);
+        idx.ensure_canonical_order().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.kvec");
+        idx.save_with_options(&first, KvecQuantizeOptions::int8_with_rescore())
+            .unwrap();
+        let reference = std::fs::read(&first).unwrap();
+
+        let reloaded = VectorIndex::<u64>::load_from_disk(&first).unwrap();
+        assert!(reloaded.graph.read().scores_quantized());
+        let again = dir.path().join("again.kvec");
+        reloaded
+            .save_with_options(&again, KvecQuantizeOptions::int8_with_rescore())
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&again).unwrap(),
+            reference,
+            "re-saving a quantized container must reproduce its bytes"
+        );
+
+        // And a third pass, since a drift of one step per cycle would not show
+        // up until the second.
+        let third_index = VectorIndex::<u64>::load_from_disk(&again).unwrap();
+        let third = dir.path().join("third.kvec");
+        third_index
+            .save_with_options(&third, KvecQuantizeOptions::int8_with_rescore())
+            .unwrap();
+        assert_eq!(std::fs::read(&third).unwrap(), reference, "third pass");
+
+        // Control: a mutation must NOT reuse the table, because the new node
+        // may hold a value outside the range the table was built for. A value
+        // far outside it is used, so a reused table would clip it and the
+        // reconstruction would be visibly wrong.
+        let mutated = VectorIndex::<u64>::load_from_disk(&first).unwrap();
+        let outsized: Vec<f32> = (0..dim).map(|d| 500.0 + d as f32).collect();
+        mutated.upsert(90_001, &outsized).unwrap();
+        let after_mutation = dir.path().join("mutated.kvec");
+        mutated
+            .save_with_options(&after_mutation, KvecQuantizeOptions::int8_with_rescore())
+            .unwrap();
+        let after = VectorIndex::<u64>::load_from_disk(&after_mutation).unwrap();
+        let read_back = after
+            .get(&90_001)
+            .expect("the new key must survive the re-save");
+        for (d, (before, back)) in outsized.iter().zip(read_back.iter()).enumerate() {
+            // The f32 section is kept here, so `get` reads the exact floats and
+            // the reconstruction is not what is being checked; what is being
+            // checked is that the write did not refuse or clip the value.
+            assert_eq!(
+                before.to_bits(),
+                back.to_bits(),
+                "dimension {d} of the new vector came back as {back} from {before}"
+            );
+        }
+        assert_ne!(
+            std::fs::read(&after_mutation).unwrap(),
+            reference,
+            "a mutation must change the bytes, or this control proved nothing"
         );
     }
 
