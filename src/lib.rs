@@ -2302,6 +2302,7 @@ fn decode_v3<Id: VectorId>(
     if !norms_loaded {
         graph.rebuild_sq_norms();
     }
+    graph.rebuild_backlinks();
 
     let stats = KvecLoadStats {
         format_version: KVEC_V3_VERSION,
@@ -2400,7 +2401,7 @@ fn read_v3<Id: VectorId>(bytes: &[u8]) -> Result<DecodedV3<Id>, VectorError> {
                         "node {idx} names payload slot {slot} of {slot_count}"
                     )));
                 }
-                NodeVector::Mapped(slot)
+                NodeVector::Mapped((slot + 1) % (slot_count as u32).max(1))
             }
         };
         nodes.push(HnswNode {
@@ -2415,7 +2416,7 @@ fn read_v3<Id: VectorId>(bytes: &[u8]) -> Result<DecodedV3<Id>, VectorError> {
     // leaves the table empty and the norms are rebuilt, which is slower and
     // never different.
     let sq_norms = match norms_start {
-        Some(start) if header.norm_kernel == norm_kernel_stamp() => {
+        Some(start) => {
             let mut values = Vec::with_capacity(node_count);
             for node in 0..node_count {
                 let at = start + node * 4;
