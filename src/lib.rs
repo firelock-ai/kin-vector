@@ -1700,6 +1700,12 @@ const KVEC_V3_PREAMBLE_LEN: usize = KVEC_V2_PREAMBLE_LEN;
 /// keeps each mapping's payload start on a cache line, and on the mmap read
 /// path the file offset is what decides that alignment because the mapping
 /// base is always page-aligned.
+///
+/// Test-only beside [`encode_v2`], the last writer that needed it. `decode_v2`
+/// does not: it reads the payload offset out of the preamble the writer put
+/// there, so a v2 file written by any past build reads back whatever alignment
+/// that build chose.
+#[cfg(test)]
 const KVEC_V2_PAYLOAD_ALIGN: usize = 64;
 
 /// Per-node header entry. Carries everything about a node except its vector,
@@ -1786,7 +1792,6 @@ fn read_u64_le(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(buf)
 }
 
-/// Serialize `graph` into a version 2 container.
 // ---------------------------------------------------------------------------
 // Version 3 container: MessagePack header + a table of mapped sections
 // ---------------------------------------------------------------------------
@@ -2413,7 +2418,8 @@ fn read_v3<Id: VectorId>(bytes: &[u8]) -> Result<DecodedV3<Id>, VectorError> {
 
     let payload = if slot_count == 0 || dimensions == 0 {
         F32Payload::Absent
-    } else if bytes[payload_start..].as_ptr() as usize % std::mem::align_of::<f32>() == 0 {
+    } else if (bytes[payload_start..].as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>())
+    {
         F32Payload::InPlace {
             offset: payload_start,
         }
@@ -2449,6 +2455,13 @@ fn read_v3<Id: VectorId>(bytes: &[u8]) -> Result<DecodedV3<Id>, VectorError> {
     })
 }
 
+/// Serialize `graph` into a version 2 container.
+///
+/// Test-only. `save` writes the current version, so nothing in the library
+/// writes v2 any more, and this exists so the version the reader still accepts
+/// stays under test: a decoder for a format nothing can produce is a decoder
+/// nothing can falsify.
+#[cfg(test)]
 fn encode_v2<Id: VectorId>(graph: &HnswGraph<Id>) -> Result<Vec<u8>, VectorError> {
     let dimensions = graph.dimensions;
     let mut nodes = Vec::with_capacity(graph.nodes.len());
