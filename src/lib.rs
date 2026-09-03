@@ -1912,8 +1912,26 @@ impl SectionDesc {
 const NORM_KERNEL_SCALAR: u8 = 0;
 const NORM_KERNEL_SIMD: u8 = 1;
 
+/// True when this build and this process resolved the NEON reduction.
+///
+/// Mirrors [`squared_norm`]'s own dispatch, which is what makes the stamp
+/// meaningful: the same condition that selects the four-lane fold selects the
+/// stamp that says so. The NEON kernel exists only on aarch64 with the `simd`
+/// feature, and every other target has exactly one reduction, so those targets
+/// answer `false` and can only ever agree with each other. That is not a
+/// platform arm hiding a case: a norm from the scalar reduction on x86 and one
+/// from the scalar reduction on aarch64 come out of the same code in the same
+/// order.
+fn simd_norm_kernel_active() -> bool {
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+    let active = simd_enabled();
+    #[cfg(not(all(feature = "simd", target_arch = "aarch64")))]
+    let active = false;
+    active
+}
+
 fn norm_kernel_stamp() -> u8 {
-    if simd_enabled() {
+    if simd_norm_kernel_active() {
         NORM_KERNEL_SIMD
     } else {
         NORM_KERNEL_SCALAR
@@ -2429,6 +2447,207 @@ fn read_v3<Id: VectorId>(bytes: &[u8]) -> Result<DecodedV3<Id>, VectorError> {
         slot_count,
         dimensions,
     })
+}
+
+fn encode_v2<Id: VectorId>(graph: &HnswGraph<Id>) -> Result<Vec<u8>, VectorError> {
+    let dimensions = graph.dimensions;
+    let mut nodes = Vec::with_capacity(graph.nodes.len());
+    // Node index of each payload slot, in slot order.
+    let mut slot_sources: Vec<usize> = Vec::with_capacity(graph.nodes.len());
+
+    for (idx, node) in graph.nodes.iter().enumerate() {
+        let payload_slot = if node.vector.is_empty() {
+            None
+        } else {
+            // A fixed stride is what makes the payload addressable by slot, so a
+            // node whose vector disagrees with the graph's dimensionality has to
+            // stop the write rather than corrupt every later slot's offset.
+            let len = graph.vector_at(idx).len();
+            if len != dimensions {
+                return Err(VectorError::IndexError(format!(
+                    "node {idx} holds {len} dimensions but the graph declares {dimensions}"
+                )));
+            }
+            let slot = slot_sources.len() as u64;
+            slot_sources.push(idx);
+            Some(slot)
+        };
+        nodes.push(KvecNodeV2 {
+            connections: node.connections.clone(),
+            level: node.level,
+            payload_slot,
+        });
+    }
+
+    let header = KvecHeaderV2 {
+        nodes,
+        entry_point: graph.entry_point,
+        max_level: graph.max_level,
+        dimensions,
+        id_to_idx: graph.id_to_idx.clone(),
+        idx_to_id: graph.idx_to_id.clone(),
+        free_list: graph.free_list.clone(),
+        reserved_legacy_slot: graph.reserved_legacy_slot,
+        descriptor: graph.descriptor.clone(),
+    };
+    let header_bytes = rmp_serde::to_vec(&header).map_err(|e| {
+        VectorError::IndexError(format!("failed to serialize HNSW index header: {e}"))
+    })?;
+
+    let payload_offset = align_up(
+        KVEC_V2_PREAMBLE_LEN + header_bytes.len(),
+        KVEC_V2_PAYLOAD_ALIGN,
+    );
+    let payload_len = slot_sources
+        .len()
+        .checked_mul(dimensions)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| {
+            VectorError::IndexError("HNSW payload size overflows a usize".to_string())
+        })?;
+
+    let mut out = vec![0u8; payload_offset + payload_len];
+    out[0..4].copy_from_slice(&KVEC_V2_MAGIC);
+    out[4..8].copy_from_slice(&KVEC_V2_VERSION.to_le_bytes());
+    out[8..16].copy_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+    out[16..24].copy_from_slice(&(payload_offset as u64).to_le_bytes());
+    out[24..32].copy_from_slice(&(slot_sources.len() as u64).to_le_bytes());
+    out[32..40].copy_from_slice(&(dimensions as u64).to_le_bytes());
+    out[KVEC_V2_PREAMBLE_LEN..KVEC_V2_PREAMBLE_LEN + header_bytes.len()]
+        .copy_from_slice(&header_bytes);
+
+    let stride = dimensions * 4;
+    for (slot, &idx) in slot_sources.iter().enumerate() {
+        let start = payload_offset + slot * stride;
+        let dst = &mut out[start..start + stride];
+        // Little-endian regardless of host byte order, so an index written on
+        // one architecture reads back identically on another.
+        for (chunk, value) in dst.chunks_exact_mut(4).zip(graph.vector_at(idx).iter()) {
+            chunk.copy_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    Ok(out)
+}
+
+/// Deserialize a version 2 container.
+fn decode_v2<Id: VectorId>(bytes: &[u8]) -> Result<(HnswGraph<Id>, KvecLoadStats), VectorError> {
+    let malformed =
+        |what: &str| VectorError::IndexError(format!("malformed kvec container: {what}"));
+
+    if bytes.len() < KVEC_V2_PREAMBLE_LEN {
+        return Err(malformed("shorter than its preamble"));
+    }
+    let version = {
+        let mut buf = [0u8; 4];
+        buf.copy_from_slice(&bytes[4..8]);
+        u32::from_le_bytes(buf)
+    };
+    if version != KVEC_V2_VERSION {
+        return Err(VectorError::IndexError(format!(
+            "unsupported kvec container version {version}"
+        )));
+    }
+
+    let header_len = read_u64_le(bytes, 8) as usize;
+    let payload_offset = read_u64_le(bytes, 16) as usize;
+    let slot_count = read_u64_le(bytes, 24) as usize;
+    let dimensions = read_u64_le(bytes, 32) as usize;
+
+    let header_end = KVEC_V2_PREAMBLE_LEN
+        .checked_add(header_len)
+        .ok_or_else(|| malformed("header length overflows"))?;
+    if header_end > bytes.len() || payload_offset < header_end {
+        return Err(malformed("header does not fit before the payload"));
+    }
+    let stride = dimensions
+        .checked_mul(4)
+        .ok_or_else(|| malformed("dimensions overflow a byte stride"))?;
+    let payload_len = slot_count
+        .checked_mul(stride)
+        .ok_or_else(|| malformed("payload size overflows"))?;
+    let payload_end = payload_offset
+        .checked_add(payload_len)
+        .ok_or_else(|| malformed("payload extent overflows"))?;
+    if payload_end > bytes.len() {
+        return Err(malformed("payload extends past the end of the file"));
+    }
+
+    let header: KvecHeaderV2<Id> = rmp_serde::from_slice(&bytes[KVEC_V2_PREAMBLE_LEN..header_end])
+        .map_err(|e| VectorError::IndexError(format!("failed to deserialize kvec header: {e}")))?;
+    // The preamble is what bounds-checking above trusted; the header is what the
+    // graph is built from. They are written together and must agree.
+    if header.dimensions != dimensions {
+        return Err(malformed(
+            "header dimensions disagree with the container preamble",
+        ));
+    }
+
+    let payload = &bytes[payload_offset..payload_end];
+    let mut nodes = Vec::with_capacity(header.nodes.len());
+    for (idx, entry) in header.nodes.iter().enumerate() {
+        let vector = match entry.payload_slot {
+            None => NodeVector::Empty,
+            Some(slot) => {
+                let slot = slot as usize;
+                if slot >= slot_count {
+                    return Err(malformed(&format!(
+                        "node {idx} names payload slot {slot} of {slot_count}"
+                    )));
+                }
+                let start = slot * stride;
+                let mut vector = vec![0f32; dimensions];
+                for (dst, chunk) in vector
+                    .iter_mut()
+                    .zip(payload[start..start + stride].chunks_exact(4))
+                {
+                    *dst = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                }
+                NodeVector::owned(vector)
+            }
+        };
+        nodes.push(HnswNode {
+            vector,
+            connections: entry.connections.clone(),
+            level: entry.level,
+        });
+    }
+
+    let mut graph = HnswGraph {
+        nodes,
+        entry_point: header.entry_point,
+        max_level: header.max_level,
+        dimensions,
+        id_to_idx: header.id_to_idx,
+        idx_to_id: header.idx_to_id,
+        free_list: header.free_list,
+        reserved_legacy_slot: header.reserved_legacy_slot,
+        descriptor: header.descriptor,
+        backlinks: Vec::new(),
+        canonical_order_dirty: false,
+        mutation_seq: 0,
+        sq_norms: Vec::new(),
+        payload: None,
+    };
+    // v2 keeps its per-float copy and its norm rebuild, because a v2 container
+    // carries no persisted norm table and its payload has to reach the heap to
+    // be addressed at all. The backlink rebuild moves off this path with v3's,
+    // since it is a property of the graph rather than of the container: nothing
+    // reads `backlinks` until a mutation, and `ensure_backlinks_ready` builds it
+    // there.
+    graph.rebuild_sq_norms();
+
+    let stats = KvecLoadStats {
+        format_version: KVEC_V2_VERSION,
+        file_bytes: bytes.len() as u64,
+        bytes_mapped: 0,
+        bytes_read_into_heap: 0,
+        bytes_decoded: header_len as u64,
+        vector_payload_bytes: payload_len as u64,
+        msgpack_float_decodes: 0,
+        vector_slots: slot_count as u64,
+    };
+    Ok((graph, stats))
 }
 
 fn recovery_tmp_path(path: &Path) -> PathBuf {
@@ -6492,8 +6711,10 @@ mod tests {
         // range rather than reporting a corrupt file.
         let mut future = encode_v3(&snapshot).unwrap();
         future[4..8].copy_from_slice(&(KVEC_MAX_READABLE_VERSION + 1).to_le_bytes());
-        let refused = decode_container::<u64>(LoadedContainer::Read(future)).unwrap_err();
-        let message = refused.to_string();
+        let message = match decode_container::<u64>(LoadedContainer::Read(future)) {
+            Ok(_) => panic!("a version above the readable range must be refused"),
+            Err(refused) => refused.to_string(),
+        };
         assert!(
             message.contains("unsupported kvec container version"),
             "refusal must name the version, got: {message}"
