@@ -6702,7 +6702,27 @@ mod tests {
             "answering a query must not build the reverse-edge index"
         );
 
-        // A mutation does need it, and the graph it leaves behind must be
+        // An UPSERT must materialize it, and this arm is what makes the
+        // `ensure_backlinks_ready` call in `commit_insertion` falsifiable.
+        // Dropping that call does not break the removal arm below, because
+        // `remove` calls `ensure_backlinks_ready` too and would self-heal. It
+        // breaks HERE: the insert's own `backlinks.push` would take the table
+        // from zero entries to one while `nodes` went from N to N + 1, leaving
+        // a table that is neither whole nor visibly absent for whatever runs
+        // next.
+        loaded
+            .upsert(9_999, &batch_test_vec(9_999, dim))
+            .expect("an upsert into a loaded index must succeed");
+        {
+            let graph = loaded.graph.read();
+            assert_eq!(
+                graph.backlinks.len(),
+                graph.nodes.len(),
+                "an upsert must leave the reverse-edge index tracking nodes"
+            );
+        }
+
+        // A removal does too, and the graph it leaves behind must be
         // consistent: no live node may still point at the freed slot.
         let victim = loaded.keys()[0];
         let freed = *loaded.graph.read().id_to_idx.get(&victim).unwrap();
