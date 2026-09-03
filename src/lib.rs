@@ -864,10 +864,21 @@ impl<Id: VectorId> HnswGraph<Id> {
         self.payload = None;
     }
 
-    /// A persistence snapshot of the graph: the serialized fields copied, with the
-    /// rebuilt-on-load derived tables dropped and the canonical-order flag cleared.
-    /// Taken under the graph lock so the heavy serialize + fsync can run after the
-    /// lock is released, without blocking concurrent upserts.
+    /// A persistence snapshot of the graph: the serialized fields copied, the
+    /// canonical-order flag cleared, and the reverse-edge index dropped because
+    /// it is rebuilt on demand and never written.
+    ///
+    /// `sq_norms` is CARRIED, unlike the reverse-edge index, and carried only
+    /// when it is whole. It is a persisted section now, so dropping it here made
+    /// the second save of a reloaded index omit the section the first save wrote
+    /// and produce different bytes for the same content, which
+    /// `a_reloaded_index_rebuilds_to_byte_identical_bytes` is what caught. A
+    /// partial table is left behind rather than carried, because writing one
+    /// would hand a later load a memo that reads as ready and answers with the
+    /// wrong norm for the entries it never saw.
+    ///
+    /// Taken under the graph lock so the heavy serialize and fsync can run after
+    /// the lock is released, without blocking concurrent upserts.
     fn clone_for_persist(&self) -> HnswGraph<Id> {
         HnswGraph {
             nodes: self.nodes.clone(),
@@ -882,7 +893,11 @@ impl<Id: VectorId> HnswGraph<Id> {
             backlinks: Vec::new(),
             canonical_order_dirty: false,
             mutation_seq: self.mutation_seq,
-            sq_norms: Vec::new(),
+            sq_norms: if self.sq_norms.len() == self.nodes.len() {
+                self.sq_norms.clone()
+            } else {
+                Vec::new()
+            },
             // Carried, not dropped: the clone's nodes may still name payload
             // slots, and an encoder resolves them through this mapping.
             payload: self.payload.clone(),
@@ -6530,6 +6545,12 @@ mod tests {
     fn a_mapped_index_ranks_bit_identically_to_a_heap_index() {
         let dim = 64;
         let built = container_fixture(400, dim);
+        // `canonical_persist_snapshot` canonicalizes the COPY and does not
+        // install it, so without this the built index would still hold the
+        // ingestion-order topology while both encoded files held the canonical
+        // one, and the comparison would be between two different graphs rather
+        // than between two encodings of one.
+        built.ensure_canonical_order().unwrap();
         let snapshot = built.canonical_persist_snapshot().unwrap().0;
 
         let dir = tempfile::tempdir().unwrap();
